@@ -1,9 +1,36 @@
 """
-1. Read S3 CSV files
+Incremental Standard Scaling and Principal Component Analysis of Data Stored
+in Large CSV Files in a AWS S3 Bucket
+
+Includes Functions to Plot Explained Variance of Principal Components and to
+Perform Necessary Preprocessing of Some of the Features
+
+General Workflow:
+1. Read CSV files from S3 bucket
 2. Iterate over CSV chunks and apply StandardScaler (two passes: fit and transform)
 (per https://stackoverflow.com/questions/52642940/feature-scaling-for-a-big-dataset)
 3. Pass scaled data to IncrementalPCA() (partial_fit, then transform on the third pass
 over CSV chunks)
+
+Copyright (c) 2021 Sasha Kapralov
+Licensed under the MIT License (see LICENSE for details)
+
+------------------------------------------------------------
+
+Usage: run from the command line as such:
+
+    # Get a list of CSV files (as a preliminary check)
+    python incremental_pca.py list 15-07
+
+    # Run PCA with 10000 chunksize, 50% sampling rate, and 10 PCs
+    python incremental_pca.py pca -s 10000 -f 0.5 -c 10
+
+    # Run PCA with default 1000 chunksize and 100% sampling rate, plotting
+    # cumulative explained variance of all principal components
+    python incremental_pca.py pca
+
+    # Run same PCA as above, but include binary features in StandardScaler
+    python incremental_pca.py pca -b
 """
 
 import argparse
@@ -37,6 +64,23 @@ s3_client = boto3.client("s3")
 # https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3.html#S3.Client.list_objects_v2
 # (keys are like 'shops15_10.csv')
 def list_csvs(bucket="my-rds-exports", prefix="shops", first_mon=""):
+    """List CSV files in S3 bucket.
+
+    Parameters:
+    -----------
+    bucket : str
+        S3 bucket containing CSV files (default: 'my-rds-exports')
+    prefix : str
+        Prefix of CSV file name (S3 key) (default: 'shops')
+    first_mon : str
+        First month of CSV data to be included in output (default: '', which
+        produces a list of all files)
+
+    Returns:
+    --------
+    csv_list : list
+        List of CSV file names (S3 keys)
+    """
     try:
         csv_list = [
             key["Key"]
@@ -80,7 +124,24 @@ def list_csvs(bucket="my-rds-exports", prefix="shops", first_mon=""):
 
 
 def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
-    _, ax = plt.subplots(figsize=(5, 3))
+    """Plot cumulative explained variance of all PCs from PCA results.
+
+    Parameters:
+    -----------
+    fit_pca : IncrementalPCA partial_fit() object
+        Results of PCA fitting
+    first_mon : str
+        First month of CSV data included in PCA
+    frac : float
+        Fraction of rows that was sampled from CSVs
+    scale_bins : bool
+        Whether binary columns were scaled with StandardScaler prior to PCA
+
+    Returns:
+    --------
+    None
+    """
+    _, ax = plt.subplots(figsize=(6, 4))
     ax.plot(np.cumsum(fit_pca.explained_variance_ratio_))
     ax.set_title("Cumulative Explained Variance Ratio of Principal Components")
     ax.set_xlabel("Number of components")
@@ -130,6 +191,22 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
 
 
 def preprocess_chunk(df, scale_bins=False):
+    """Perform necessary preprocessing steps on each chunk of CSV data prior
+    to passing data to StandardScaler.
+
+    Parameters:
+    -----------
+    df : DataFrame
+        Chunk of CSV data
+    scale_bins : bool
+        Whether binary columns are to be included in returned dataframe and
+        passed to StandardScaler (default: False)
+
+    Returns:
+    --------
+    DataFrame
+        Dataframe with preprocessed features
+    """
     # drop string columns, quantty sold columns that include quantity from current day,
     # and row identification columns (shop, item, date)
     cols_to_drop = (
@@ -253,6 +330,28 @@ def pca(
     frac=1.0,
     scale_bins=False,
 ):
+    """Implement StandardScaler and IncrementalPCA with partial_fit() methods.
+
+    Parameters:
+    -----------
+    bucket : str
+        S3 bucket containing CSV data (default: 'my-rds-exports')
+    chunksize : int
+        Number of rows to include in each iteration of read_csv() (default: 1000)
+    n_components: None or int
+        Number of principal components to compute (all, if None (default))
+    first_mon : str
+        First month of CSV data included in PCA (all, if '' (default))
+    frac : float
+        Fraction of rows to sample from CSVs (default: 1.0)
+    scale_bins : bool
+        Whether binary columns are to be scaled with StandardScaler prior to PCA
+        (default: False)
+
+    Returns:
+    --------
+    None
+    """
     csv_list = list_csvs(first_mon=first_mon)
     assert isinstance(csv_list, list), f"csv_list is not a list, but {type(csv_list)}!"
 
@@ -452,6 +551,7 @@ def pca(
                 response = s3_client.put_object(
                     Body=transformed_data, Bucket="sales-demand-data", Key=key
                 )
+                logging.info("PCA-transformed data successfully uploaded to S3.")
             except ClientError:
                 logging.exception(
                     "Exception occurred during writing PCA-transformed data to S3."
@@ -465,6 +565,22 @@ def pca(
 
 
 def valid_date(s):
+    """Convert command-line date argument to YY-MM datetime value.
+
+    Parameters:
+    -----------
+    s : str
+        Command-line argument for first month of data to be used
+
+    Returns:
+    --------
+    Datetime.datetime object (format: %y-%m)
+
+    Raises:
+    -------
+    ArgumentTypeError
+        if input string cannot be parsed according to %y-%m strptime format
+    """
     try:
         return datetime.datetime.strptime(s, "%y-%m")
     except ValueError:
@@ -473,6 +589,23 @@ def valid_date(s):
 
 
 def valid_frac(s):
+    """Convert command-line fraction argument to float value.
+
+    Parameters:
+    -----------
+    s : str
+        Command-line argument for fraction of rows to sample
+
+    Returns:
+    --------
+    float
+
+    Raises:
+    -------
+    ArgumentTypeError
+        if input string cannot be converted to float or if the resulting float
+        is a negative value
+    """
     try:
         f = float(s)
     except ValueError:
