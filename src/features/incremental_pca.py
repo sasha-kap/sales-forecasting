@@ -23,20 +23,21 @@ Usage: run from the command line as such:
     python incremental_pca.py list 15-07
 
     # Run PCA with 10000 chunksize, 50% sampling rate, and 10 PCs
-    python incremental_pca.py pca -s 10000 -f 0.5 -c 10
+    python incremental_pca.py pca 15-10 -s 10000 -f 0.5 -c 10
 
     # Run PCA with default 1000 chunksize and 100% sampling rate, plotting
     # cumulative explained variance of all principal components
-    python incremental_pca.py pca
+    python incremental_pca.py pca 15-09
 
     # Run same PCA as above, but include binary features in StandardScaler
-    python incremental_pca.py pca -b
+    python incremental_pca.py pca 15-08 -b
 """
 
 import argparse
 import datetime
 import io
-from itertools import chain, tee
+
+# from itertools import chain, tee
 import json
 import logging
 import os
@@ -355,8 +356,9 @@ def pca(
     csv_list = list_csvs(first_mon=first_mon)
     assert isinstance(csv_list, list), f"csv_list is not a list, but {type(csv_list)}!"
 
-    with open("pd_types_from_psql_mapping.json", "r") as f:
+    with open("./features/pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
+        pd_types.pop("sale_date")
     # change types of binary features to 'uint8'
     bin_features = (
         "d_holiday",
@@ -377,118 +379,49 @@ def pca(
     )
     pd_types = {k: "uint8" if v in bin_features else v for k, v in pd_types.items()}
 
-    reader1, reader2, reader3 = tee(
-        chain.from_iterable(
-            [
-                pd.read_csv(
-                    s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body"),
-                    encoding="utf-8",
-                    dtype=pd_types,
-                    chunksize=chunksize,
-                )
-                for csv_file in csv_list
-            ]
-        ),
-        3,
-    )
+    # reader1, reader2, reader3 = tee(
+    #     chain.from_iterable(
+    #         [
+    #             pd.read_csv(
+    #                 s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body"),
+    #                 encoding="utf-8",
+    #                 dtype=pd_types,
+    #                 chunksize=chunksize,
+    #             )
+    #             for csv_file in csv_list
+    #         ]
+    #     ),
+    #     3,
+    # )
+
+    # def process_result_s3_chunks(bucket, key, chunksize):
+    #     csv_obj = s3_client.get_object(Bucket=bucket, Key=key)
+    #     body = csv_obj['Body']
+    #     for df in pd.read_csv(body, chunksize=chunksize):
+    #         process(df)
 
     scaler = StandardScaler()
     sklearn_pca = IncrementalPCA(n_components=n_components)
 
     print("Starting first iteration over CSVs - StandardScaler partial fit...")
     start_time = current_time = time.perf_counter()
-    for index, chunk in enumerate(reader1):
-        if index % 25 == 0:
-            print(
-                f"current index is {index} and current time is "
-                f"{datetime.datetime.strftime(datetime.datetime.now(), format='%Y-%m-%d %H:%M:%S')}"
-            )
-            print(
-                f"elapsed time since last check (in secs): {round(time.perf_counter() - current_time, 2)}"
-            )
-            print(
-                f"total elapsed time (in secs): {round(time.perf_counter() - start_time, 2)}"
-            )
-            current_time = time.perf_counter()
-        # scaler.partial_fit(chunk.sample(frac=0.5, random_state=42)['x'].to_numpy().reshape(1,-1))
-
-        # things to think about:
-        # which transformations to apply to which features (identify count data - manually?)
-        # apply square root / log transform transformations *and* standard scale (or just one of the two)?
-        # how to deal with negative values if decide to apply square root / log transforms
-
-        # take the sample of chunk
-        # perform necessary transformations on necessary features
-        # also, drop any necessary features
-        # pass transformed features to scaler.partial_fit()
-        # binary columns are to be scaled with an optional boolean parameter
-        # if they are not to be scaled, they are to be excluded from StandardScaler
-        scaler.partial_fit(
-            preprocess_chunk(
-                chunk.sample(frac=frac, random_state=42).sort_values(
-                    by=["shop_id", "item_id", "sale_date"]
-                ),
-                scale_bins=scale_bins,
-            )
-        )
-        # they will just need to be added to scaled data for PCA
-
-        # print(scaler.mean_, scaler.var_)
-
-    # all_scaled_data = []
-    # reader = pd.read_csv(response.get("Body"), chunksize=100)
-    print(
-        "Starting second iteration over CSVs - StandardScaler transform and IncrementalPCA partial fit..."
-    )
-    for index, chunk in enumerate(reader2):
-        if index % 25 == 0:
-            print(
-                f"current index is {index} and current time is "
-                f"{datetime.datetime.strftime(datetime.datetime.now(), format='%Y-%m-%d %H:%M:%S')}"
-            )
-            print(
-                f"elapsed time since last check (in secs): {round(time.perf_counter() - current_time, 2)}"
-            )
-            print(
-                f"total elapsed time (in secs): {round(time.perf_counter() - start_time, 2)}"
-            )
-            current_time = time.perf_counter()
-        # sample the chunk again
-        # again perform the same necessary transformations
-        # pass transformed features (and all other features that will be going into PCA) to scaler.transform()
-        scaled_data = scaler.transform(
-            preprocess_chunk(
-                chunk.sample(frac=frac, random_state=42).sort_values(
-                    by=["shop_id", "item_id", "sale_date"]
-                ),
-                scale_bins=scale_bins,
-            )
-        )
-        # pass standard-scaled data (plus binary features if they were not scaled) to PCA partial fit
-        if not scale_bins:
-            scaled_data = pd.concat(
-                [
-                    scaled_data,
-                    chunk.sample(frac=frac, random_state=42)
-                    .sort_values(by=["shop_id", "item_id", "sale_date"])
-                    .select_dtypes(include="uint8"),
-                ],
-                axis=1,
-            )
-        sklearn_pca.partial_fit(scaled_data)
-
-    if n_components is None:
-        logging.info(
-            f"The estimated number of principal components: {sklearn_pca.n_components_}"
-        )
-        logging.info(f"The total number of samples seen: {sklearn_pca.n_samples_seen_}")
-        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins)
-
-    else:
-        print("Starting third iteration over CSVs - IncrementalPCA transform...")
-        pca_transformed = None
-        shape_list = list()
-        for index, chunk in enumerate(reader3):
+    global_idx = -1
+    for csv_file in csv_list:
+        csv_body = s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body")
+        for index, chunk in enumerate(
+            pd.read_csv(
+                csv_body, chunksize=chunksize, dtype=pd_types, parse_dates=["sale_date"]
+            ),
+            global_idx + 1,
+        ):
+            if index == 0:
+                logging.debug(
+                    f"Columns in DF converted from CSV: {list(enumerate(chunk.columns))}"
+                )
+            if chunk.isna().any().any():
+                logging.debug(
+                    f"Chunk {index} has {', '.join(chunk.columns[chunk.isna().any()])} columns with nulls"
+                )
             if index % 25 == 0:
                 print(
                     f"current index is {index} and current time is "
@@ -501,28 +434,148 @@ def pca(
                     f"total elapsed time (in secs): {round(time.perf_counter() - start_time, 2)}"
                 )
                 current_time = time.perf_counter()
-            chunk_sub = chunk.sample(frac=frac, random_state=42).sort_values(
-                by=["shop_id", "item_id", "sale_date"]
-            )
-            id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date"]].values
-            # after chunk is sampled (above), apply the same transformation and standard scaling
-            # pass the scaled data to PCA transform()
-            scaled_data = scaler.transform(
-                preprocess_chunk(chunk_sub, scale_bins=scale_bins)
-            )
-            if not scale_bins:
-                scaled_data = pd.concat(
-                    [scaled_data, chunk_sub.select_dtypes(include="uint8")], axis=1
-                )
+            # scaler.partial_fit(chunk.sample(frac=0.5, random_state=42)['x'].to_numpy().reshape(1,-1))
 
-            tx_chunk = sklearn_pca.transform(scaled_data)
-            if pca_transformed is None:
-                pca_transformed = np.hstack(id_cols_arr, tx_chunk)
-                shape_list.append(pca_transformed.shape)
-            else:
-                tx_chunk = np.hstack(id_cols_arr, tx_chunk)
-                shape_list.append(tx_chunk.shape)
-                pca_transformed = np.vstack(pca_transformed, tx_chunk)
+            # things to think about:
+            # which transformations to apply to which features (identify count data - manually?)
+            # apply square root / log transform transformations *and* standard scale (or just one of the two)?
+            # how to deal with negative values if decide to apply square root / log transforms
+
+            # take the sample of chunk
+            # perform necessary transformations on necessary features
+            # also, drop any necessary features
+            # pass transformed features to scaler.partial_fit()
+            # binary columns are to be scaled with an optional boolean parameter
+            # if they are not to be scaled, they are to be excluded from StandardScaler
+            scaler.partial_fit(
+                preprocess_chunk(
+                    chunk.sample(frac=frac, random_state=42).sort_values(
+                        by=["shop_id", "item_id", "sale_date"]
+                    ),
+                    scale_bins=scale_bins,
+                )
+            )
+            global_idx = index
+            # they will just need to be added to scaled data for PCA
+
+            # print(scaler.mean_, scaler.var_)
+
+    # all_scaled_data = []
+    # reader = pd.read_csv(response.get("Body"), chunksize=100)
+    print(
+        "Starting second iteration over CSVs - StandardScaler transform and IncrementalPCA partial fit..."
+    )
+    global_idx = -1
+    for csv_file in csv_list:
+        csv_body = s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body")
+        for index, chunk in enumerate(
+            pd.read_csv(
+                csv_body, chunksize=chunksize, dtype=pd_types, parse_dates=["sale_date"]
+            ),
+            global_idx + 1,
+        ):
+            if index % 25 == 0:
+                print(
+                    f"current index is {index} and current time is "
+                    f"{datetime.datetime.strftime(datetime.datetime.now(), format='%Y-%m-%d %H:%M:%S')}"
+                )
+                print(
+                    f"elapsed time since last check (in secs): {round(time.perf_counter() - current_time, 2)}"
+                )
+                print(
+                    f"total elapsed time (in secs): {round(time.perf_counter() - start_time, 2)}"
+                )
+                current_time = time.perf_counter()
+            # sample the chunk again
+            # again perform the same necessary transformations
+            # pass transformed features (and all other features that will be going into PCA) to scaler.transform()
+            scaled_data = scaler.transform(
+                preprocess_chunk(
+                    chunk.sample(frac=frac, random_state=42).sort_values(
+                        by=["shop_id", "item_id", "sale_date"]
+                    ),
+                    scale_bins=scale_bins,
+                )
+            )
+            # pass standard-scaled data (plus binary features if they were not scaled) to PCA partial fit
+            if not scale_bins:
+                scaled_data = np.hstack(
+                    (
+                        scaled_data,
+                        (
+                            chunk.sample(frac=frac, random_state=42)
+                            .sort_values(by=["shop_id", "item_id", "sale_date"])
+                            .select_dtypes(include="uint8")
+                            .to_numpy()
+                        ),
+                    )
+                )
+            sklearn_pca.partial_fit(scaled_data)
+            global_idx = index
+
+    if n_components is None:
+        logging.info(
+            f"The estimated number of principal components: {sklearn_pca.n_components_}"
+        )
+        logging.info(f"The total number of samples seen: {sklearn_pca.n_samples_seen_}")
+        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins)
+
+    else:
+        print("Starting third iteration over CSVs - IncrementalPCA transform...")
+        pca_transformed = None
+        shape_list = list()
+        global_idx = -1
+        for csv_file in csv_list:
+            csv_body = s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body")
+            for index, chunk in enumerate(
+                pd.read_csv(
+                    csv_body,
+                    chunksize=chunksize,
+                    dtype=pd_types,
+                    parse_dates=["sale_date"],
+                ),
+                global_idx + 1,
+            ):
+                if index % 25 == 0:
+                    print(
+                        f"current index is {index} and current time is "
+                        f"{datetime.datetime.strftime(datetime.datetime.now(), format='%Y-%m-%d %H:%M:%S')}"
+                    )
+                    print(
+                        f"elapsed time since last check (in secs): {round(time.perf_counter() - current_time, 2)}"
+                    )
+                    print(
+                        f"total elapsed time (in secs): {round(time.perf_counter() - start_time, 2)}"
+                    )
+                    current_time = time.perf_counter()
+                chunk_sub = chunk.sample(frac=frac, random_state=42).sort_values(
+                    by=["shop_id", "item_id", "sale_date"]
+                )
+                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date"]].values
+                # after chunk is sampled (above), apply the same transformation and standard scaling
+                # pass the scaled data to PCA transform()
+                scaled_data = scaler.transform(
+                    preprocess_chunk(chunk_sub, scale_bins=scale_bins)
+                )
+                if not scale_bins:
+                    scaled_data = np.hstack(
+                        (
+                            scaled_data,
+                            chunk_sub.select_dtypes(include="uint8").to_numpy(),
+                        )
+                    )
+
+                tx_chunk = sklearn_pca.transform(scaled_data)
+                if pca_transformed is None:
+                    pca_transformed = np.hstack((id_cols_arr, tx_chunk))
+                    shape_list.append(pca_transformed.shape)
+                else:
+                    tx_chunk = np.hstack((id_cols_arr, tx_chunk))
+                    shape_list.append(tx_chunk.shape)
+                    pca_transformed = np.vstack((pca_transformed, tx_chunk))
+
+                global_idx = index
+
         print(f"Final shape of PCA-transformed data: {pca_transformed.shape}")
         print(
             f"Total bytes consumed by elements of PCA-transformed array: {pca_transformed.nbytes}"
@@ -688,6 +741,8 @@ def main():
         logging.getLogger("botocore").setLevel(logging.CRITICAL)
         logging.getLogger("s3transfer").setLevel(logging.CRITICAL)
         logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+        # also, suppress irrelevant logging by matplotlib
+        logging.getLogger("matplotlib").setLevel(logging.CRITICAL)
 
         # Check if code is being run on EC2 instance (vs locally)
         my_user = os.environ.get("USER")
