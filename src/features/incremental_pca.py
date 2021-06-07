@@ -191,7 +191,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
         logging.exception("PCA explained variance plot file was not copied to S3.")
 
 
-def preprocess_chunk(df, scale_bins=False):
+def preprocess_chunk(df, index, scale_bins=False):
     """Perform necessary preprocessing steps on each chunk of CSV data prior
     to passing data to StandardScaler.
 
@@ -199,6 +199,8 @@ def preprocess_chunk(df, scale_bins=False):
     -----------
     df : DataFrame
         Chunk of CSV data
+    index : int
+        Chunk counter
     scale_bins : bool
         Whether binary columns are to be included in returned dataframe and
         passed to StandardScaler (default: False)
@@ -235,6 +237,9 @@ def preprocess_chunk(df, scale_bins=False):
         lambda x: float(x.replace(",", "."))
     )
 
+    # replace previously missed negative infinity value in one of the columns
+    df['id_cat_qty_sold_per_item_last_7d'] = df['id_cat_qty_sold_per_item_last_7d'].replace(-np.inf, 0)
+
     # cast to int the column that was for some reason cast to float in PostgreSQL
     df["id_num_unique_shops_prior_to_day"] = df[
         "id_num_unique_shops_prior_to_day"
@@ -261,37 +266,37 @@ def preprocess_chunk(df, scale_bins=False):
     prefix = "i_item_cat_broad_"
     df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
     cols = df_cats.columns.union([prefix + x for x in broad_cats])
-    df_cats = df_cats.reindex(cols, axis=1, fill_value=0)
+    df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     mons_of_first_sale = [x for x in range(13)]
     prefix = "i_item_first_mon_"
     df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
     cols = df_first_months.columns.union([prefix + str(x) for x in mons_of_first_sale])
-    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0)
+    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     years = [2013, 2014, 2015]
     prefix = "d_year_"
     df_years = pd.get_dummies(df.d_year, prefix=prefix)
     cols = df_years.columns.union([prefix + str(x) for x in years])
-    df_years = df_years.reindex(cols, axis=1, fill_value=0)
+    df_years = df_years.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     dow = [x for x in range(7)]
     prefix = "d_day_of_week_"
     df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
     cols = df_dow.columns.union([prefix + str(x) for x in dow])
-    df_dow = df_dow.reindex(cols, axis=1, fill_value=0)
+    df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     months = [x for x in range(12)]
     prefix = "d_month_"
     df_months = pd.get_dummies(df.d_month, prefix=prefix)
     cols = df_months.columns.union([prefix + str(x) for x in months])
-    df_months = df_months.reindex(cols, axis=1, fill_value=0)
+    df_months = df_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     quarters = [x for x in range(1, 5)]
     prefix = "d_quarter_"
     df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
     cols = df_quarters.columns.union([prefix + str(x) for x in quarters])
-    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0)
+    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype('uint8')
     # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
 
     df = pd.concat(
@@ -316,6 +321,14 @@ def preprocess_chunk(df, scale_bins=False):
         ],
         axis=1,
     )
+
+    # check each chunk for infinity values and stop script if any values are found
+    if df[df.isin([np.inf, -np.inf])].count().any():
+        cts = df[df.isin([np.inf, -np.inf])].count().to_dict()
+        non_zero_cts = {k: v for k, v in cts.items() if v > 0}
+        logging.debug(f"Chunk {index} has columns with infinity values: "
+            f"{non_zero_cts}")
+        sys.exit(1)
 
     # drop binary columns if they are not to be scaled with StandardScaler
     if not scale_bins:
@@ -447,15 +460,21 @@ def pca(
             # pass transformed features to scaler.partial_fit()
             # binary columns are to be scaled with an optional boolean parameter
             # if they are not to be scaled, they are to be excluded from StandardScaler
-            scaler.partial_fit(
-                preprocess_chunk(
-                    chunk.sample(frac=frac, random_state=42).sort_values(
-                        by=["shop_id", "item_id", "sale_date"]
-                    ),
-                    scale_bins=scale_bins,
+            try:
+                scaler.partial_fit(
+                    preprocess_chunk(
+                        chunk.sample(frac=frac, random_state=42).sort_values(
+                            by=["shop_id", "item_id", "sale_date"]
+                        ),
+                        index,
+                        scale_bins=scale_bins,
+                    )
                 )
-            )
-            global_idx = index
+                global_idx = index
+            except ValueError:
+                unique_dict = {col: chunk[col].unique() for col in chunk.columns}
+                logging.debug(f"Unique values in chunk that produced ValueError: {unique_dict}")
+                sys.exit(1)
             # they will just need to be added to scaled data for PCA
 
             # print(scaler.mean_, scaler.var_)
@@ -494,6 +513,7 @@ def pca(
                     chunk.sample(frac=frac, random_state=42).sort_values(
                         by=["shop_id", "item_id", "sale_date"]
                     ),
+                    index,
                     scale_bins=scale_bins,
                 )
             )
@@ -555,7 +575,7 @@ def pca(
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
                 scaled_data = scaler.transform(
-                    preprocess_chunk(chunk_sub, scale_bins=scale_bins)
+                    preprocess_chunk(chunk_sub, index, scale_bins=scale_bins)
                 )
                 if not scale_bins:
                     scaled_data = np.hstack(
