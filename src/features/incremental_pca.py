@@ -212,6 +212,7 @@ def preprocess_chunk(df, index, scale_bins=False):
     """
     # drop string columns, quantty sold columns that include quantity from current day,
     # and row identification columns (shop, item, date)
+    # also drop sid_coef_var_price, which cannot be reliably constructed for test data
     cols_to_drop = (
         [
             "i_item_category_id",
@@ -222,6 +223,7 @@ def preprocess_chunk(df, index, scale_bins=False):
             "i_item_name",
             "s_city",
             "s_shop_name",
+            "sid_coef_var_price",
         ]
         + [col for col in df.columns if col.endswith("_qty_sold_day")]
         + ["d_day_total_qty_sold"]
