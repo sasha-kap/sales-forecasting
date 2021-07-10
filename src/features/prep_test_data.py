@@ -76,6 +76,9 @@ TO DO:
     - not sure if feasible to calculate this feature for new shop-items without having price
 - look into parallelizing the SQL code via multiple connections/cursors
     - use autocommit (conn.autocommit = True)
+    - threading
+        - create one function for any query, then pass that function and the right set of queries to each thread
+            - save each set of queries in its own .sql file
 - write the script for the whole prediction pipeline
     - create separate tables of features (id_new_day, sd_new_day, etc.)
     - export the data out of Postgres as one joined table
@@ -92,8 +95,6 @@ TO DO:
 
 - MAKE IT POSSIBLE TO RUN PREDICTIONS ON A FEW DAYS AT A TIME AND RESUME FROM STOP POINT
 
-- IF GOING TO RUN ON EC2, NEED TO UPLOAD LOG, CSVs TO S3 (columns_output_new_day_tables.csv)
-
 - make a diagram of how/when features and predictions are added to/deleted from existing tables
 for first model and later models
 
@@ -101,6 +102,72 @@ for first model and later models
 - loop over 30 days (Nov 1 thru Nov 30)
 - create separate tables of features for the current day in the loop
 - export the data out of Postgres as one joined table
+
+PSYCOPG2 LOGGING CONNECTION
+
+- how to run multiple queries in an efficient manner
+    - if running different queries using different connections/cursors, what happens
+    if one query fails
+        - or one thread fails if using threading
+    - what happens if there is a drop in network connection
+    - add sys.exit() for when an exception occurs with a query
+- how to check one day's worth of predicted values and stop the script
+    - probably check the values before they are loaded back to Postgres
+    - automatically, exit the script if some kind of flag is raised on those values
+
+- ADD A CHECK FOR QUERY RETURNING CORRECT OBJECT, E.G.,:
+        if curs.fetchone() is None:
+            raise ValueError("account belonging to user not found")
+- CREATE A FUNCTION PER SEPARATE SECTION OF QUERIES AND PASS IT THE CONNECTION AS ARGUMENT
+    - ALSO PASS ANY ARGUMENTS TO THE QUERY AS ARGUMENTS TO THE FUNCTION, E.G.,
+            def verify_account(conn, user, account):
+                """
+                Verify that the account is held by the user.
+                """
+                with conn.cursor() as curs:
+                    sql = (
+                        "SELECT 1 AS verified FROM accounts a "
+                        "JOIN users u on u.id = a.owner_id "
+                        "WHERE u.username=%s AND a.id=%s"
+                    )
+                    curs.execute(sql, (user, account))
+- PUT SQL QUERIES INTO A .sql FILE AND READ IT WHEN NEED TO EXECUTE A QUERY, FOR EXAMPLE:
+        def createdb(conn, schema="schema.sql"):
+            with open(schema, 'r') as f:
+                sql = f.read()
+            try:
+                with conn.cursor() as curs:
+                    curs.execute(sql)
+                    conn.commit()
+            except Exception as e:
+                conn.rollback()
+                raise e
+- USE CONTEXT MANAGER FOR QUERY EXECUTION, FOR EXAMPLE:
+        def check_daily_deposit(conn, account):
+            """
+            Raise an exception if the deposit limit has been exceeded.
+            """
+            with conn.cursor() as curs:
+                sql = (
+                    "SELECT amount FROM ledger "
+                    "WHERE date=now()::date AND type='credit' AND account_id=%s"
+                )
+                curs.execute(sql, (account,))
+                total = sum(row[0] for row in curs.fetchall())
+                if total > MAX_DEPOSIT_LIMIT:
+                    raise Exception("daily deposit limit has been exceeded!")
+
+ADD CONN.NOTICES OUTPUT TO QUERIES
+        # execute the provided SQL query
+        cur.execute(sql_query, params)
+        # Make the changes to the database persistent
+        conn.commit()
+        # Send list of the session's messages sent to the client to log
+        for line in conn.notices:
+            logging.debug(line.strip("\n"))
+        # close the communication with the PostgreSQL
+        cur.close()
+log_fname - needs to be a parameter in class methods
 '''
 
 import argparse
@@ -116,121 +183,13 @@ import boto3
 from botocore.exceptions import ClientError
 from ec2_metadata import ec2_metadata
 import psycopg2
+from psycopg2.sql import SQL, Identifier
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
 
 from utils.config import config
 from utils.rds_instance_mgmt import start_instance, stop_instance
 from utils.timer import Timer
-
-
-@Timer(logger=logging.info)
-def query_col_names(csv_path):
-    """ Connect to the PostgreSQL database server and query info on columns in
-    existing tables.
-
-    Parameters:
-    -----------
-    csv_path : str or pathlib.Path() object
-        Filepath (directory and filename) where to save query results
-
-    Returns:
-    --------
-    None
-    """
-    conn = None
-    try:
-        # read connection parameters
-        db_params = config(section="postgresql")
-
-        # connect to the PostgreSQL server
-        logging.info("Connecting to the PostgreSQL database...")
-        conn = psycopg2.connect(**db_params)
-
-        # create a cursor to perform database operations
-        cur = conn.cursor()
-
-        # Get information on columns in all tables from the information_schema.columns catalog
-        # https://www.postgresql.org/docs/current/infoschema-columns.html
-        query = """
-            SELECT
-               table_schema,
-               table_name,
-               column_name,
-               data_type,
-               is_nullable
-            FROM
-               information_schema.columns
-            WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-        """
-
-        outputquery = "COPY ({0}) TO STDOUT WITH CSV HEADER".format(query)
-        # csv_fname = "columns_output_new_day_tables.csv"
-        # csv_path = csv_dir.joinpath(csv_fname)
-        with open(csv_path, "w") as f:
-            cur.copy_expert(outputquery, f)
-
-        # Make the changes to the database persistent
-        conn.commit()
-        # close the communication with the PostgreSQL
-        cur.close()
-
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.exception("Exception occurred")
-
-    finally:
-        if conn is not None:
-            conn.close()
-            logging.info("Database connection closed.")
-
-
-@Timer(logger=logging.info)
-def run_query(sql_query, params=None):
-    """ Connect to the PostgreSQL database server and run specified query.
-
-    Parameters:
-    -----------
-    sql_query : str
-        SQL query to execute
-    params : list, tuple or dict, optional, default: None
-        List of parameters to pass to execute method
-
-    Returns:
-    --------
-    None
-    """
-
-    conn = None
-    try:
-        # read connection parameters
-        db_params = config(section="postgresql")
-
-        # connect to the PostgreSQL server
-        logging.info("Connecting to the PostgreSQL database...")
-        conn = psycopg2.connect(**db_params)
-
-        # create a cursor to perform database operations
-        cur = conn.cursor()
-
-        logging.debug(f"SQL query to be executed: {sql_query}")
-
-        # execute the provided SQL query
-        cur.execute(sql_query, params)
-        # Make the changes to the database persistent
-        conn.commit()
-        # Send list of the session's messages sent to the client to log
-        for line in conn.notices:
-            logging.debug(line.strip("\n"))
-        # close the communication with the PostgreSQL
-        cur.close()
-
-    except (Exception, psycopg2.DatabaseError) as error:
-        logging.exception("Exception occurred")
-
-    finally:
-        if conn is not None:
-            conn.close()
-            logging.info("Database connection closed.")
 
 
 def valid_day(s):
@@ -257,6 +216,535 @@ def valid_day(s):
         raise argparse.ArgumentTypeError(msg)
 
 
+# Warning Unlike file objects or other resources, exiting the connection’s with
+# block doesn’t close the connection, but only the transaction associated to it.
+# If you want to make sure the connection is closed after a certain point, you
+# should still use a try-catch block:
+# conn = psycopg2.connect(DSN)
+# try:
+#     # connection usage
+# finally:
+#     conn.close()
+class single_thread_db_class:
+    def __init__(self, is_aws):
+        """
+
+        Parameters:
+        -----------
+        is_aws : bool
+            Indicator for whether script is running on a AWS EC2 instance,
+            default: false
+        """
+        self.is_aws = is_aws
+        if self.is_aws:
+            self.s3_client = boto3.client("s3")
+        try:
+            # read connection parameters
+            db_params = config(section="postgresql")
+
+            # connect to the PostgreSQL server
+            self.conn = psycopg2.connect(**db_params)
+            logging.info("Connected to the PostgreSQL database.")
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred during database connection.")
+
+    @Timer(logger=logging.info)
+    def query_col_names(self, csv_path):
+        """ Query info on columns in existing tables.
+
+        Parameters:
+        -----------
+        csv_path : str or pathlib.Path() object
+            Filepath (directory and filename) where to save query results
+
+        Returns:
+        --------
+        None
+        """
+        try:
+            with self.conn.cursor() as cur:
+                sql = (
+                    "SELECT table_schema, table_name, "
+                    "column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema "
+                    "NOT IN ('pg_catalog', 'information_schema')"
+                )
+                outputquery = "COPY ({0}) TO STDOUT WITH CSV HEADER".format(sql)
+
+                with open(csv_path, "w") as f:
+                    cur.copy_expert(outputquery, f)
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+        else:
+            # copy CSV file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./csv/{cols_csv_fname}", "my-ec2-logs", cols_csv_fname
+                    )
+                    logging.info(
+                        "CSV file of column names in _new_day "
+                        "tables successfully copied to S3."
+                    )
+                except ClientError as e:
+                    logging.exception(
+                        "CSV file of columnn names in _new_day "
+                        "tables was not copied to S3."
+                    )
+
+    @Timer(logger=logging.info)
+    def delete_from_sales_cleaned(self):
+        """ Delete rows from previous model (deletion to only happen once per model)
+        in the sales_cleaned table.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                sql = (
+                    "DELETE FROM sales_cleaned WHERE sale_date >= make_date(2015,11,1)"
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def delete_test_prd(self):
+        """ Delete rows for the test period from feature-containing tables.
+        This step must precede insertion of features into those tables.
+        """
+        try:
+            with self.conn.cursor() as cur:
+                sql = (
+                    "DELETE FROM item_dates "
+                    "WHERE sale_date >= make_date(2015,11,1); "
+                    "DELETE FROM shop_dates "
+                    "WHERE sale_date >= make_date(2015,11,1); "
+                    "DELETE FROM shop_item_dates "
+                    "WHERE sale_date >= make_date(2015,11,1);"
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def export_features(self):
+        try:
+            # join sid_new_day with id_new_day on item,
+            # with sd_new_day on shop,
+            # with dates on date (after lags have been assigned),
+            # with items on item, with shops on shop
+            # then export the fully joined table to CSV and store in S3 bucket
+            col_name_dict = {
+                "sid_new_day": "sid",
+                "id_new_day": "id",
+                "sd_new_day": "sd",
+                "dates": "d",
+                "items": "i",
+                "shops": "s",
+            }
+
+            sql_col_list = []
+            with open(f"./{col_names_csv_path}", "r") as col_file:
+                csv_reader = csv.reader(col_file, delimiter=",")
+                next(csv_reader, None)  # skip header row
+                for row in csv_reader:
+                    if row[1] in [
+                        "sid_new_day",
+                        "id_new_day",
+                        "sd_new_day",
+                        "dates",
+                        "items",
+                        "shops",
+                    ] and not (
+                        row[1] != "sid_new_day"
+                        and row[2] in ["shop_id", "item_id", "sale_date"]
+                    ):
+                        sql_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
+            cols_to_select = ", ".join(sql_col_list)
+
+            with self.conn.cursor() as cur:
+                query = (
+                    f"SELECT {cols_to_select} FROM sid_new_day sid "
+                    "LEFT JOIN id_new_day id "
+                    "ON sid.item_id = id.item_id "
+                    "LEFT JOIN sd_new_day sd "
+                    "ON sid.shop_id = id.shop_id "
+                    "LEFT JOIN dates d "
+                    "ON sid.sale_date = d.sale_date "
+                    "LEFT JOIN items i "
+                    "ON sid.item_id = i.item_id "
+                    "LEFT JOIN shops s "
+                    "ON sid.shop_id = s.shop_id"
+                )
+                sql = (
+                    f"SELECT * from aws_s3.query_export_to_s3('{query}',"
+                    "aws_commons.create_s3_uri('my-rds-exports', 'test_data_for_scoring.csv', 'us-west-2'),"
+                    "options :='format csv, header');"
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def append_features(self):
+        try:
+            # append individual features to the right existing tables (e.g., id_… features get appended to the item_dates table)
+            # insert into items_ver(item_id, item_group, name)
+            # select item_id, item_group, name from items where item_id=2;
+            # NEED TO GENERATE THE LIST OF COLUMNS IN EACH NEW TABLE (id_new_day, sd_new_day, sid_new_day)
+            # AND THEN PLACE INTO THE QUERY BELOW IN BOTH PLACES
+            id_col_list = []
+            sd_col_list = []
+            sid_new_col_list = []
+            sid_main_col_list = []
+            with open(f"./{col_names_csv_path}", "r") as col_file:
+                csv_reader = csv.reader(col_file, delimiter=",")
+                next(csv_reader, None)  # skip header row
+                for row in csv_reader:
+                    if row[1] == "id_new_day":
+                        # id_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
+                        id_col_list.append(row[2])
+                    elif row[1] == "sd_new_day":
+                        # sd_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
+                        sd_col_list.append(row[2])
+                    elif row[1] == "sid_new_day":
+                        sid_new_col_list.append(row[2])
+                        # sid_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
+                    elif row[1] == "shop_item_dates":
+                        sid_main_col_list.append(row[2])
+            id_cols_to_select = ", ".join(id_col_list)
+            sd_cols_to_select = ", ".join(sd_col_list)
+            # some cols in sid_new_day do not belong in shop_item_dates and, possibly,
+            # some shop_item_dates columns are not in sid_new_day, so need to create
+            # a list with common elements:
+            sid_col_list = list(set(sid_new_col_list) & set(sid_main_col_list))
+            sid_cols_to_select = ", ".join(sid_col_list)
+
+            with self.conn.cursor() as cur:
+                sql = (
+                    f"INSERT INTO item_dates ({id_cols_to_select}) "
+                    f"SELECT {id_cols_to_select} FROM id_new_day; "
+                    f"INSERT INTO shop_dates ({sd_cols_to_select}) "
+                    f"SELECT {sd_cols_to_select} FROM sd_new_day; "
+                    f"INSERT INTO shop_item_dates ({sid_cols_to_select}) "
+                    f"SELECT {sid_cols_to_select} FROM sid_new_day; "
+                    # SOME OF THE SID_ FEATURES NEED TO BE INSERTED INTO OTHER SID_ TABLES -
+                    # for now, decided not to insert anything into those other sid_ tables
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def import_preds_into_new_table(self, first_day):
+        """
+        Parameters:
+        -----------
+        first_day : bool
+            Indicator for currently generating and storing predictions for the
+            first day in the test period
+        """
+        try:
+            if first_day:
+                with self.conn.cursor() as cur:
+                    sql = (
+                        "DROP TABLE IF EXISTS daily_sid_predictions; "
+                        "CREATE TABLE daily_sid_predictions (shop_id smallint NOT NULL, "
+                        "item_id int NOT NULL, sale_date date NOT NULL, model1 int NOT NULL)"
+                    )
+                    cur.execute(sql)
+
+            # import CSV data to created table
+            # predictions for different days are appended to existing table
+            with self.conn.cursor() as cur:
+                sql = (
+                    f"SELECT aws_s3.table_import_from_s3('daily_sid_predictions', '', '(format csv, header)', "
+                    f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_model1.csv', 'us-west-2'))"
+                    # if going to have separate CSVs for each day's predictions, need to update the preds_model1.csv parameter above to include date
+                    # same for csv path below (in the import_preds_into_existing_table function)
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def import_preds_into_existing_table(self, first_day, model_col):
+        """
+        Parameters:
+        -----------
+        first_day : bool
+            Indicator for currently generating and storing predictions for the
+            first day in the test period
+        model_col : str
+            Name of column in daily predictions table containing predictions
+            for current model
+        """
+        try:
+            if first_day:
+                with self.conn.cursor() as cur:
+                    sql_str = (
+                        "ALTER TABLE daily_sid_predictions "
+                        "DROP COLUMN IF EXISTS {0}, "
+                        "ADD COLUMN {0} smallint NOT NULL;"
+                    )
+                    sql = SQL(sql_str).format(Identifier(model_col))
+                    cur.execute(sql)
+
+            # predictions are joined with existing rows on shop-item-date
+            with self.conn.cursor() as cur:
+                sql_str = (
+                    "CREATE TEMP TABLE new_model_preds (shop_id smallint NOT NULL, "
+                    "item_id int NOT NULL, sale_date date NOT NULL, {0} smallint NOT NULL); "
+                    "SELECT aws_s3.table_import_from_s3('new_model_preds', '', '(format csv, header)', "
+                    f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_{model_col}.csv', 'us-west-2')); "
+                    "UPDATE daily_sid_predictions dsp "
+                    "SET {0} = {1} "
+                    "FROM new_model_preds nmp "
+                    "WHERE dsp.shop_id = nmp.shop_id AND dsp.item_id = nmp.item_id AND "
+                    "dsp.sale_date = nmp.sale_date;"
+                )
+                sql = SQL(sql_str).format(
+                    Identifier(model_col), Identifier("nmp", model_col),
+                )
+                cur.execute(sql)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def check_size_of_preds_table(self, model_cnt):
+        """
+        Parameters:
+        -----------
+        model_cnt : int
+            Model number (number of the model currently being worked on)
+        """
+        # query size of daily_sid_predictions to make sure it has the right
+        # number of columns and rows after being populated with another day of data
+        row_and_col_cts_can_be_used = True
+        with self.conn.cursor() as cur:
+            sql = (
+                "WITH cols AS ("
+                "SELECT column_name "
+                "FROM information_schema.columns "
+                "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
+                "AND table_name = 'daily_sid_predictions'), "
+                "SELECT count(column_name) AS n_cols "
+                "FROM cols"
+            )
+            try:
+                n_cols = conn.execute(sql).fetchone()[0]
+            except TypeError as e:
+                row_and_col_cts_can_be_used = False
+                logging.exception(
+                    "Exception occurred when querying number of columns "
+                    "in daily_sid_predictions table:"
+                )
+
+            sql = "SELECT count(*) FROM daily_sid_predictions AS n_rows "
+            try:
+                n_rows = conn.execute(sql).fetchone()[0]
+            except TypeError as e:
+                row_and_col_cts_can_be_used = False
+                logging.exception(
+                    "Exception occurred when querying number of rows "
+                    "in daily_sid_predictions table:"
+                )
+            if row_and_col_cts_can_be_used:
+                # there should be 214,200 rows per day
+                # there should be 3 (shop, item, date) + 2 * model columns
+                if (n_rows != 214_200 * i) | (n_cols != (3 + 1 * model_cnt)):
+                    logging.error(
+                        f"Expected {214_200 * i} rows and {3 + 1 * model_cnt} "
+                        "columns at this point in the predictions table; "
+                        f"instead, the table has {n_rows} rows and {n_cols} columns."
+                    )
+                    sys.exit(1)
+
+    @Timer(logger=logging.info)
+    def agg_preds(self, model_col, params=None):
+        """
+        Parameters:
+        -----------
+        model_col : str
+            Name of column in daily predictions table containing predictions
+            for current model
+        params : list, tuple or dict, optional, default: None
+            List of parameters to pass to execute method
+        """
+        try:
+            with self.conn.cursor() as cur:
+                sql_str = (
+                    "WITH day_total AS ("
+                    "SELECT sale_date, sum({0}) AS d_day_total_qty_sold "
+                    "FROM daily_sid_predictions "
+                    "WHERE sale_date = %(curr_date)s "
+                    "GROUP BY sale_date) "
+                    "UPDATE dates d "
+                    "SET d_day_total_qty_sold = dt.d_day_total_qty_sold "
+                    "FROM day_total dt "
+                    "WHERE d.sale_date = dt.sale_date; "
+                )
+                sql = SQL(sql_str).format(Identifier(model_col))
+                cur.execute(sql, params)
+            with self.conn.cursor() as cur:
+                sql_str = (
+                    "WITH item_total AS ("
+                    "SELECT item_id, sum({0}) AS id_item_qty_sold_day "
+                    "FROM daily_sid_predictions "
+                    "WHERE sale_date = %(curr_date)s "
+                    "GROUP BY item_id) "
+                    "UPDATE item_dates id "
+                    "SET id_item_qty_sold_day = it.id_item_qty_sold_day "
+                    "FROM item_total it "
+                    "WHERE id.sale_date = %(curr_date)s AND id.item_id = it.item_id; "
+                )
+                sql = SQL(sql_str).format(Identifier(model_col))
+                cur.execute(sql, params)
+            with self.conn.cursor() as cur:
+                sql_str = (
+                    "WITH shop_total AS ("
+                    "SELECT shop_id, sum({0}) AS sd_shop_qty_sold_day "
+                    "FROM daily_sid_predictions "
+                    "WHERE sale_date = %(curr_date)s "
+                    "GROUP BY shop_id) "
+                    "UPDATE shop_dates sd "
+                    "SET sd_shop_qty_sold_day = st.sd_shop_qty_sold_day "
+                    "FROM shop_total st "
+                    "WHERE sd.sale_date = %(curr_date)s AND sd.shop_id = st.shop_id; "
+                )
+                sql = SQL(sql_str).format(Identifier(model_col))
+                cur.execute(sql, params)
+            with self.conn.cursor() as cur:
+                sql_str = (
+                    "UPDATE shop_item_dates sid "
+                    "SET sid_shop_item_qty_sold_day = {0} "
+                    "FROM daily_sid_predictions dsp "
+                    "WHERE sid.sale_date = %(curr_date)s AND sid.shop_id = dsp.shop_id AND "
+                    "sid.item_id = dsp.item_id; "
+                )
+                sql = SQL(sql_str).format(Identifier("dsp", model_col))
+                cur.execute(sql, params)
+            with self.conn.cursor() as cur:
+                # insert non-zero sid predicted quantity into sales_cleaned
+                sql_str = (
+                    "INSERT INTO sales_cleaned (shop_id, item_id, sale_date, item_cnt_day) "
+                    "SELECT shop_id, item_id, sale_date, {0} AS item_cnt_day "
+                    "FROM daily_sid_predictions "
+                    "WHERE {0} <> 0 AND sale_date = %(curr_date)s"
+                )
+                sql = SQL(sql_str).format(Identifier(model_col))
+                cur.execute(sql, params)
+        except (Exception, psycopg2.DatabaseError) as error:
+            logging.exception("Exception occurred")
+            if self.conn is not None:
+                self.conn.close()
+                logging.info("Database connection closed.")
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if self.is_aws:
+                try:
+                    response = self.s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+            sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser()
     # need the following command-line arguments:
@@ -265,7 +753,7 @@ def main():
     # number of days to predict (check that first date + number of days - 1 does not surpass 11/30)
     parser.add_argument(
         "modelnum",
-        metavar="<modelnum>"
+        metavar="<modelnum>",
         help="model counter (first model should be numbered with 1)",
         type=int,
     )
@@ -310,6 +798,7 @@ def main():
     csv_dir = Path.cwd().joinpath("csv")
     path = Path(csv_dir)
     path.mkdir(exist_ok=True)
+    cols_csv_fname = "columns_output_new_day_tables.csv"
 
     logging.basicConfig(
         level=logging.DEBUG,
@@ -347,37 +836,28 @@ def main():
 
     logging.info(f"The Python version is {platform.python_version()}.")
 
+    # start RDS instance
     start_instance()
 
-    logging.info(f"Starting to run predictions for model {args.model_num}...")
+    logging.info(f"Starting to run predictions for model {args.modelnum}...")
 
-    for i, curr_date in enumerate([
-        args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)
-    ], 1):
+    # create database connection
+    db = single_thread_db_class(is_aws)
 
-        logging.info(
-            f"Starting to run predictions for {datetime.datetime.strftime(curr_date, format='%Y-%m-%d')}..."
-        )
+    for i, curr_date in enumerate(
+        [args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)], 1
+    ):
+
+        curr_date_str = datetime.datetime.strftime(curr_date, format="%Y-%m-%d")
+        logging.info(f"Starting to run predictions for {curr_date_str}...")
 
         first_day = curr_date == datetime.date(2015, 11, 1)
         first_model = args.modelnum == 1
         params = {"curr_date": curr_date}
 
         if not first_model and first_day:
-            # delete rows from previous model (deletion to only happen once) in the sales_cleaned table
-            query = (
-                "DELETE FROM sales_cleaned " "WHERE sale_date >= make_date(2015,11,1) "
-            )
-            # delete rows for the test period from feature-containing tables
-            # THIS QUERY BELOW PRECEDES INSERTION OF FEATURES INTO THOSE TABLES
-            query = (
-                "DELETE FROM item_dates "
-                "WHERE sale_date >= make_date(2015,11,1); "
-                "DELETE FROM shop_dates "
-                "WHERE sale_date >= make_date(2015,11,1); "
-                "DELETE FROM shop_item_dates "
-                "WHERE sale_date >= make_date(2015,11,1); "
-            )
+            db.delete_from_sales_cleaned()
+            db.delete_test_prd()
 
         # create separate tables of features for new day:
         # id_new_day, sd_new_day, sid_new_day
@@ -386,107 +866,16 @@ def main():
 
         # QUERIES TO CREATE _NEW_DAY TABLES AND THE FEATURES IN THEM MOVED TO QUERIES.PY
 
-        col_names_csv_path = csv_dir.joinpath("columns_output_new_day_tables.csv")
+        col_names_csv_path = csv_dir.joinpath(cols_csv_fname)
         # RUN SUMMARY QUERY TO GENERATE COLUMN LIST FOR THE TABLES TO BE JOINED
         # AND THEN USE THAT LIST TO GENERATE LIST OF COLUMNS FOR SELECT CLAUSE BELOW
         # (THAT SUMMARY QUERY JUST NEEDS TO BE RUN ONCE IF OUTPUT CSV DOES NOT EXIST)
         if not Path(col_names_csv_path).is_file():
-            query_col_names(col_names_csv_path)
+            db.query_col_names(col_names_csv_path)
 
-        # join sid_new_day with id_new_day on item,
-        # with sd_new_day on shop,
-        # with dates on date (after lags have been assigned),
-        # with items on item, with shops on shop
-        # then export the fully joined table to CSV and store in S3 bucket
-        col_name_dict = {
-            "sid_new_day": "sid",
-            "id_new_day": "id",
-            "sd_new_day": "sd",
-            "dates": "d",
-            "items": "i",
-            "shops": "s",
-        }
+        db.export_features()
 
-        sql_col_list = []
-        with open(f"./{col_names_csv_path}", "r") as col_file:
-            csv_reader = csv.reader(col_file, delimiter=",")
-            next(csv_reader, None)  # skip header row
-            for row in csv_reader:
-                if row[1] in [
-                    "sid_new_day",
-                    "id_new_day",
-                    "sd_new_day",
-                    "dates",
-                    "items",
-                    "shops",
-                ] and not (
-                    row[1] != "sid_new_day"
-                    and row[2] in ["shop_id", "item_id", "sale_date"]
-                ):
-                    sql_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
-        cols_to_select = ", ".join(sql_col_list)
-
-        query = (
-            f"SELECT {cols_to_select} FROM sid_new_day sid "
-            "LEFT JOIN id_new_day id "
-            "ON sid.item_id = id.item_id "
-            "LEFT JOIN sd_new_day sd "
-            "ON sid.shop_id = id.shop_id "
-            "LEFT JOIN dates d "
-            "ON sid.sale_date = d.sale_date "
-            "LEFT JOIN items i "
-            "ON sid.item_id = i.item_id "
-            "LEFT JOIN shops s "
-            "ON sid.shop_id = s.shop_id"
-        )
-        sql = (
-            f"SELECT * from aws_s3.query_export_to_s3('{query}',"
-            "aws_commons.create_s3_uri('my-rds-exports', 'test_data_for_scoring.csv', 'us-west-2'),"
-            "options :='format csv, header');"
-        )
-        run_query(sql)
-
-        # append individual features to the right existing tables (e.g., id_… features get appended to the item_dates table)
-        # insert into items_ver(item_id, item_group, name)
-        # select item_id, item_group, name from items where item_id=2;
-        # NEED TO GENERATE THE LIST OF COLUMNS IN EACH NEW TABLE (id_new_day, sd_new_day, sid_new_day)
-        # AND THEN PLACE INTO THE QUERY BELOW IN BOTH PLACES
-        id_col_list = []
-        sd_col_list = []
-        sid_new_col_list = []
-        sid_main_col_list = []
-        with open(f"./{col_names_csv_path}", "r") as col_file:
-            csv_reader = csv.reader(col_file, delimiter=",")
-            next(csv_reader, None)  # skip header row
-            for row in csv_reader:
-                if row[1] == "id_new_day":
-                    # id_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
-                    id_col_list.append(row[2])
-                elif row[1] == "sd_new_day":
-                    # sd_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
-                    sd_col_list.append(row[2])
-                elif row[1] == "sid_new_day":
-                    sid_new_col_list.append(row[2])
-                    # sid_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
-                elif row[1] == "shop_item_dates":
-                    sid_main_col_list.append(row[2])
-        id_cols_to_select = ", ".join(id_col_list)
-        sd_cols_to_select = ", ".join(sd_col_list)
-        # some cols in sid_new_day do not belong in shop_item_dates and, possibly,
-        # some shop_item_dates columns are not in sid_new_day, so need to create
-        # a list with common elements:
-        sid_col_list = list(set(sid_new_col_list) & set(sid_main_col_list))
-        sid_cols_to_select = ", ".join(sid_col_list)
-        query = (
-            f"INSERT INTO item_dates ({id_cols_to_select}) "
-            f"SELECT {id_cols_to_select} FROM id_new_day; "
-            f"INSERT INTO shop_dates ({sd_cols_to_select}) "
-            f"SELECT {sd_cols_to_select} FROM sd_new_day; "
-            f"INSERT INTO shop_item_dates ({sid_cols_to_select}) "
-            f"SELECT {sid_cols_to_select} FROM sid_new_day; "
-            # SOME OF THE SID_ FEATURES NEED TO BE INSERTED INTO OTHER SID_ TABLES -
-            # for now, decided not to insert anything into those other sid_ tables
-        )
+        db.append_features()
 
         # HERE IS WHERE PREDICTIONS ARE GENERATED
 
@@ -508,130 +897,26 @@ def main():
         #   except for sales_cleaned -> need to delete rows from previous model (for all days: 11/1 thru 11/30) and insert rows anew
         #       so this deletion only needs to happen once at the beginning of running predictions for that model
         if first_model:
-
-            if first_day:
-
-                sql = (
-                    f"DROP TABLE IF EXISTS daily_sid_predictions; "
-                    f"CREATE TABLE daily_sid_predictions (shop_id smallint NOT NULL, "
-                    f"item_id int NOT NULL, sale_date date NOT NULL, model1 int NOT NULL)"
-                )
-                run_query(sql)
-
-            # import CSV data to created table
-            # predictions for different days are appended to existing table
-            sql = (
-                f"SELECT aws_s3.table_import_from_s3('daily_sid_predictions', '', '(format csv, header)', "
-                f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_model1.csv', 'us-west-2'))"
-                # if going to have separate CSVs for each day's predictions, need to update the preds_model1.csv parameter above to include date
-                # same for csv path below
-            )
-            run_query(sql)
-
-            # COMBINE THE TWO QUERIES ABOVE (TO RUN ON SAME CONNECTION)
-
+            db.import_preds_into_new_table(first_day)
         else:
+            db.import_preds_into_existing_table(first_day, f"model{args.modelnum}")
 
-            # predictions are joined with existing rows on shop-item-date
-            sql = (
-                "CREATE TEMP TABLE new_model_preds (shop_id smallint NOT NULL, "
-                f"item_id int NOT NULL, sale_date date NOT NULL, model{args.modelnum} smallint NOT NULL); "
-                "SELECT aws_s3.table_import_from_s3('new_model_preds', '', '(format csv, header)', "
-                f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_model{args.modelnum}.csv', 'us-west-2')); "
-                "ALTER TABLE daily_sid_predictions "
-                f"ADD COLUMN model{args.modelnum} smallint NOT NULL; "
-                "UPDATE daily_sid_predictions dsp "
-                f"SET model{args.modelnum} = nmp.model{args.modelnum} "
-                "FROM new_model_preds nmp "
-                "WHERE dsp.shop_id = nmp.shop_id AND dsp.item_id = nmp.item_id AND "
-                "dsp.sale_date = nmp.sale_date"
-            )
+        db.check_size_of_preds_table(args.modelnum)
 
-        # query size of daily_sid_predictions to make sure it has the right
-        # number of columns and rows after being populated with another day of data
-        query = (
-            "WITH cols AS ("
-            "SELECT column_name "
-            "FROM information_schema.columns "
-            "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
-            "AND table_name = 'daily_sid_predictions'), "
-            "SELECT count(column_name) AS n_cols "
-            "FROM cols"
-        )
-        n_cols = conn.execute(query).fetchone()[0]
-        query = (
-            "SELECT count(*) FROM daily_sid_predictions AS n_rows "
-        )
-        n_rows = conn.execute(query).fetchone()[0]
-        # there should be 214,200 rows per day
-        # there should be 3 (shop, item, date) + 2 * model columns
-        if (n_rows != 214_200 * i) | (n_cols != (3 + 1 * args.modelnum)):
-            logging.error(
-                f"Expected {214_200 * i} rows and {3 + 1 * args.modelnum} "
-                "columns at this point in the predictions table; "
-                f"instead, the table has {n_rows} rows and {n_cols} columns."
-            )
-            sys.exit(1)
-
-        query = (
-            "WITH day_total AS ("
-            f"SELECT sale_date, sum(model{args.modelnum}) AS d_day_total_qty_sold "
-            "FROM daily_sid_predictions "
-            "WHERE sale_date = %(curr_date)s "
-            "GROUP BY sale_date) "
-            "UPDATE dates d "
-            "SET d_day_total_qty_sold = dt.d_day_total_qty_sold "
-            "FROM day_total dt "
-            "WHERE d.sale_date = dt.sale_date; "
-        )
-        query = (
-            "WITH item_total AS ("
-            f"SELECT item_id, sum(model{args.modelnum}) AS id_item_qty_sold_day "
-            "FROM daily_sid_predictions "
-            "WHERE sale_date = %(curr_date)s "
-            "GROUP BY item_id) "
-            "UPDATE item_dates id "
-            "SET id_item_qty_sold_day = it.id_item_qty_sold_day "
-            "FROM item_total it "
-            "WHERE id.sale_date = %(curr_date)s AND id.item_id = it.item_id; "
-        )
-        query = (
-            "WITH shop_total AS ("
-            f"SELECT shop_id, sum(model{args.modelnum}) AS sd_shop_qty_sold_day "
-            "FROM daily_sid_predictions "
-            "WHERE sale_date = %(curr_date)s "
-            "GROUP BY shop_id) "
-            "UPDATE shop_dates sd "
-            "SET sd_shop_qty_sold_day = st.sd_shop_qty_sold_day "
-            "FROM shop_total st "
-            "WHERE sd.sale_date = %(curr_date)s AND sd.shop_id = st.shop_id; "
-        )
-        query = (
-            "UPDATE shop_item_dates sid "
-            f"SET sid_shop_item_qty_sold_day = dsp.model{args.modelnum} "
-            "FROM daily_sid_predictions dsp "
-            "WHERE sid.sale_date = %(curr_date)s AND sid.shop_id = dsp.shop_id AND "
-            "sid.item_id = dsp.item_id; "
-        )
-        # insert non-zero sid predicted quantity into sales_cleaned
-        query = (
-            "INSERT INTO sales_cleaned (shop_id, item_id, sale_date, item_cnt_day) "
-            f"SELECT shop_id, item_id, sale_date, model{args.modelnum} AS item_cnt_day "
-            "FROM daily_sid_predictions "
-            f"WHERE model{args.modelnum} <> 0 AND sale_date = %(curr_date)s"
-        )
+        db.agg_preds(f"model{args.modelnum}", params)
 
     if args.stop == True:
         stop_instance()
 
-    # copy log file to S3 bucket
-    s3_client = boto3.client("s3")
-    try:
-        response = s3_client.upload_file(
-            f"./logs/{log_fname}", "my-ec2-logs", log_fname
-        )
-    except ClientError as e:
-        logging.exception("Log file was not copied to S3.")
+    # copy log file to S3 bucket if running script on a EC2 instance
+    if is_aws:
+        s3_client = boto3.client("s3")
+        try:
+            response = s3_client.upload_file(
+                f"./logs/{log_fname}", "my-ec2-logs", log_fname
+            )
+        except ClientError as e:
+            logging.exception("Log file was not copied to S3.")
 
 
 if __name__ == "__main__":
