@@ -30,10 +30,10 @@ TO DO:
     - for shop-items in train data, continue counting from last value
     - for new shop-items during the test period, assign 0's to Nov 1 shop-items and count up from there
 - add sale date column to id_new_day, sd_new_day and sid_new_day tables - DONE
-- convert make_date() function in queries to date parameter: datetime.date(2015,11,1)
+- convert make_date() function in queries to date parameter: datetime.date(2015,11,1) - DONE
     to be used a parameter to be passed to the execute() method
         - make_date(___) becomes %(curr_date)s - DONE
-        - params becomes {'curr_date': datetime.date(2015,11,1)}
+        - params becomes {'curr_date': datetime.date(2015,11,1)} - DONE
         - example (from https://www.psycopg.org/docs/usage.html#passing-parameters-to-sql-queries):
             >>> cur.execute("""
             ...     INSERT INTO some_table (an_int, a_date, another_date, a_string)
@@ -167,7 +167,6 @@ ADD CONN.NOTICES OUTPUT TO QUERIES
             logging.debug(line.strip("\n"))
         # close the communication with the PostgreSQL
         cur.close()
-log_fname - needs to be a parameter in class methods
 '''
 
 import argparse
@@ -216,26 +215,20 @@ def valid_day(s):
         raise argparse.ArgumentTypeError(msg)
 
 
-# Warning Unlike file objects or other resources, exiting the connection’s with
-# block doesn’t close the connection, but only the transaction associated to it.
-# If you want to make sure the connection is closed after a certain point, you
-# should still use a try-catch block:
-# conn = psycopg2.connect(DSN)
-# try:
-#     # connection usage
-# finally:
-#     conn.close()
 class single_thread_db_class:
-    def __init__(self, is_aws):
-        """
+    def __init__(self, is_aws, log_fname):
+        """Create database connection.
 
         Parameters:
         -----------
         is_aws : bool
             Indicator for whether script is running on a AWS EC2 instance,
             default: false
+        log_fname : str
+            Name of file where log will be sent
         """
         self.is_aws = is_aws
+        self.log_fname = log_fname
         if self.is_aws:
             self.s3_client = boto3.client("s3")
         try:
@@ -244,19 +237,30 @@ class single_thread_db_class:
 
             # connect to the PostgreSQL server
             self.conn = psycopg2.connect(**db_params)
+            self.conn.autocommit = True
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
             logging.info("Connected to the PostgreSQL database.")
 
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred during database connection.")
 
+    def close_db_conn(self):
+        """ Close PostgreSQL database connection."""
+        if self.conn is not None:
+            self.conn.close()
+            logging.info("Database connection closed.")
+
     @Timer(logger=logging.info)
-    def query_col_names(self, csv_path):
-        """ Query info on columns in existing tables.
+    def query_col_names(self, csv_path, csv_fname):
+        """ Query info on columns in existing tables, saving output to CSV file.
 
         Parameters:
         -----------
         csv_path : str or pathlib.Path() object
             Filepath (directory and filename) where to save query results
+        csv_fname : str
+            Name of file (including .csv extension) to contain query output
 
         Returns:
         --------
@@ -277,7 +281,7 @@ class single_thread_db_class:
                     cur.copy_expert(outputquery, f)
 
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in query_col_names function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -285,7 +289,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -297,7 +301,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./csv/{cols_csv_fname}", "my-ec2-logs", cols_csv_fname
+                        f"./csv/{csv_fname}", "my-ec2-logs", csv_fname
                     )
                     logging.info(
                         "CSV file of column names in _new_day "
@@ -315,13 +319,16 @@ class single_thread_db_class:
         in the sales_cleaned table.
         """
         try:
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     "DELETE FROM sales_cleaned WHERE sale_date >= make_date(2015,11,1)"
                 )
                 cur.execute(sql)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in delete_from_sales_cleaned function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -329,7 +336,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -342,6 +349,7 @@ class single_thread_db_class:
         This step must precede insertion of features into those tables.
         """
         try:
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     "DELETE FROM item_dates "
@@ -352,8 +360,10 @@ class single_thread_db_class:
                     "WHERE sale_date >= make_date(2015,11,1);"
                 )
                 cur.execute(sql)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in delete_test_prd function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -361,7 +371,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -370,6 +380,7 @@ class single_thread_db_class:
 
     @Timer(logger=logging.info)
     def export_features(self):
+        """ Export features from PostgreSQL to CSV file. """
         try:
             # join sid_new_day with id_new_day on item,
             # with sd_new_day on shop,
@@ -425,7 +436,7 @@ class single_thread_db_class:
                 )
                 cur.execute(sql)
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in export_features function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -433,7 +444,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -442,8 +453,10 @@ class single_thread_db_class:
 
     @Timer(logger=logging.info)
     def append_features(self):
+        """ Append individual features to the appropriate existing tables
+        (e.g., id_... features are appended to the item_dates table).
+        """
         try:
-            # append individual features to the right existing tables (e.g., id_… features get appended to the item_dates table)
             # insert into items_ver(item_id, item_group, name)
             # select item_id, item_group, name from items where item_id=2;
             # NEED TO GENERATE THE LIST OF COLUMNS IN EACH NEW TABLE (id_new_day, sd_new_day, sid_new_day)
@@ -475,6 +488,7 @@ class single_thread_db_class:
             sid_col_list = list(set(sid_new_col_list) & set(sid_main_col_list))
             sid_cols_to_select = ", ".join(sid_col_list)
 
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     f"INSERT INTO item_dates ({id_cols_to_select}) "
@@ -487,8 +501,10 @@ class single_thread_db_class:
                     # for now, decided not to insert anything into those other sid_ tables
                 )
                 cur.execute(sql)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in append_features function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -496,7 +512,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -505,7 +521,9 @@ class single_thread_db_class:
 
     @Timer(logger=logging.info)
     def import_preds_into_new_table(self, first_day):
-        """
+        """ Import predictions from first model into daily_sid_predictions table
+        in PostgreSQL database.
+
         Parameters:
         -----------
         first_day : bool
@@ -514,6 +532,7 @@ class single_thread_db_class:
         """
         try:
             if first_day:
+                del self.conn.notices[:] # clear the notices list before executing next query
                 with self.conn.cursor() as cur:
                     sql = (
                         "DROP TABLE IF EXISTS daily_sid_predictions; "
@@ -521,9 +540,12 @@ class single_thread_db_class:
                         "item_id int NOT NULL, sale_date date NOT NULL, model1 int NOT NULL)"
                     )
                     cur.execute(sql)
+                for line in self.conn.notices:
+                    logging.debug(line.strip('\n'))
 
             # import CSV data to created table
             # predictions for different days are appended to existing table
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     f"SELECT aws_s3.table_import_from_s3('daily_sid_predictions', '', '(format csv, header)', "
@@ -532,8 +554,10 @@ class single_thread_db_class:
                     # same for csv path below (in the import_preds_into_existing_table function)
                 )
                 cur.execute(sql)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in import_preds_into_new_table function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -541,7 +565,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -550,7 +574,9 @@ class single_thread_db_class:
 
     @Timer(logger=logging.info)
     def import_preds_into_existing_table(self, first_day, model_col):
-        """
+        """ Import predictions from any model after the first model into
+        daily_sid_predictions table in PostgreSQL database.
+
         Parameters:
         -----------
         first_day : bool
@@ -562,6 +588,7 @@ class single_thread_db_class:
         """
         try:
             if first_day:
+                del self.conn.notices[:] # clear the notices list before executing next query
                 with self.conn.cursor() as cur:
                     sql_str = (
                         "ALTER TABLE daily_sid_predictions "
@@ -570,8 +597,11 @@ class single_thread_db_class:
                     )
                     sql = SQL(sql_str).format(Identifier(model_col))
                     cur.execute(sql)
+                for line in self.conn.notices:
+                    logging.debug(line.strip('\n'))
 
             # predictions are joined with existing rows on shop-item-date
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql_str = (
                     "CREATE TEMP TABLE new_model_preds (shop_id smallint NOT NULL, "
@@ -588,8 +618,10 @@ class single_thread_db_class:
                     Identifier(model_col), Identifier("nmp", model_col),
                 )
                 cur.execute(sql)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in import_preds_into_existing_table function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -597,7 +629,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -606,27 +638,28 @@ class single_thread_db_class:
 
     @Timer(logger=logging.info)
     def check_size_of_preds_table(self, model_cnt):
-        """
+        """ Query size of daily_sid_predictions to make sure it has the right
+        number of columns and rows after being populated with another day of data.
+
         Parameters:
         -----------
         model_cnt : int
             Model number (number of the model currently being worked on)
         """
-        # query size of daily_sid_predictions to make sure it has the right
-        # number of columns and rows after being populated with another day of data
         row_and_col_cts_can_be_used = True
+        del self.conn.notices[:] # clear the notices list before executing next query
         with self.conn.cursor() as cur:
             sql = (
                 "WITH cols AS ("
                 "SELECT column_name "
                 "FROM information_schema.columns "
                 "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
-                "AND table_name = 'daily_sid_predictions'), "
+                "AND table_name = 'daily_sid_predictions') "
                 "SELECT count(column_name) AS n_cols "
                 "FROM cols"
             )
             try:
-                n_cols = conn.execute(sql).fetchone()[0]
+                n_cols = cur.execute(sql).fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
                 logging.exception(
@@ -634,29 +667,38 @@ class single_thread_db_class:
                     "in daily_sid_predictions table:"
                 )
 
-            sql = "SELECT count(*) FROM daily_sid_predictions AS n_rows "
+        with self.conn.cursor() as cur:
+            sql = "SELECT count(*) FROM daily_sid_predictions AS n_rows"
             try:
-                n_rows = conn.execute(sql).fetchone()[0]
+                n_rows = cur.execute(sql).fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
                 logging.exception(
                     "Exception occurred when querying number of rows "
                     "in daily_sid_predictions table:"
                 )
-            if row_and_col_cts_can_be_used:
-                # there should be 214,200 rows per day
-                # there should be 3 (shop, item, date) + 2 * model columns
-                if (n_rows != 214_200 * i) | (n_cols != (3 + 1 * model_cnt)):
-                    logging.error(
-                        f"Expected {214_200 * i} rows and {3 + 1 * model_cnt} "
-                        "columns at this point in the predictions table; "
-                        f"instead, the table has {n_rows} rows and {n_cols} columns."
-                    )
-                    sys.exit(1)
+        for line in self.conn.notices:
+            logging.debug(line.strip('\n'))
+
+        if row_and_col_cts_can_be_used:
+            # there should be 214,200 rows per day
+            # there should be 3 (shop, item, date) + 2 * model columns
+            if (n_rows != 214_200 * i) or (n_cols != (3 + 1 * model_cnt)):
+                logging.error(
+                    f"Expected {214_200 * i} rows and {3 + 1 * model_cnt} "
+                    "columns at this point in the predictions table; "
+                    f"instead, the table has {n_rows} rows and {n_cols} columns."
+                )
+                sys.exit(1)
 
     @Timer(logger=logging.info)
     def agg_preds(self, model_col, params=None):
-        """
+        """ Aggregate shop-item-date level predictions to appropriate level and
+        update quantity sold values in dates (d_day_total_qty_sold), item_dates
+        (id_item_qty_sold_day), shop_dates (sd_shop_qty_sold_day), shop_item_dates
+        (sid_shop_item_qty_sold_day) and sales_cleaned (only non-zero predicted
+        shop-item quantities) tables.
+
         Parameters:
         -----------
         model_col : str
@@ -666,6 +708,7 @@ class single_thread_db_class:
             List of parameters to pass to execute method
         """
         try:
+            del self.conn.notices[:] # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql_str = (
                     "WITH day_total AS ("
@@ -728,8 +771,10 @@ class single_thread_db_class:
                 )
                 sql = SQL(sql_str).format(Identifier(model_col))
                 cur.execute(sql, params)
+            for line in self.conn.notices:
+                logging.debug(line.strip('\n'))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred")
+            logging.exception("Exception occurred in agg_preds function.")
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -737,7 +782,7 @@ class single_thread_db_class:
             if self.is_aws:
                 try:
                     response = self.s3_client.upload_file(
-                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                        f"./logs/{self.log_fname}", "my-ec2-logs", self.log_fname
                     )
                     logging.info("Log file was successfully copied to S3.")
                 except ClientError as e:
@@ -792,7 +837,9 @@ def main():
     log_dir = Path.cwd().joinpath("logs")
     path = Path(log_dir)
     path.mkdir(exist_ok=True)
-    log_fname = f"logging_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')}.log"
+    log_fname = (
+        f"prep_test_data_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')}.log"
+    )
     log_path = log_dir.joinpath(log_fname)
 
     csv_dir = Path.cwd().joinpath("csv")
@@ -842,7 +889,7 @@ def main():
     logging.info(f"Starting to run predictions for model {args.modelnum}...")
 
     # create database connection
-    db = single_thread_db_class(is_aws)
+    db = single_thread_db_class(is_aws, log_fname)
 
     for i, curr_date in enumerate(
         [args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)], 1
@@ -871,7 +918,7 @@ def main():
         # AND THEN USE THAT LIST TO GENERATE LIST OF COLUMNS FOR SELECT CLAUSE BELOW
         # (THAT SUMMARY QUERY JUST NEEDS TO BE RUN ONCE IF OUTPUT CSV DOES NOT EXIST)
         if not Path(col_names_csv_path).is_file():
-            db.query_col_names(col_names_csv_path)
+            db.query_col_names(col_names_csv_path, cols_csv_fname)
 
         db.export_features()
 
@@ -904,6 +951,9 @@ def main():
         db.check_size_of_preds_table(args.modelnum)
 
         db.agg_preds(f"model{args.modelnum}", params)
+
+    # close database connection
+    db.close_db_conn()
 
     if args.stop == True:
         stop_instance()
