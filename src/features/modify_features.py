@@ -402,46 +402,46 @@ def main():
 
         # change null values in newly created values
         # SKIPPING THE 5 QUERIES BELOW FOR NOW, AS THOSE COLUMNS CAN BE SET TO 0'S LATER
-        sql = (
-            "UPDATE sid_addl_roll_qty_stats "
-            "SET sid_shop_item_rolling_7d_max_qty = 0, "
-            "sid_shop_item_rolling_7d_min_qty = 0, "
-            "sid_shop_item_rolling_7d_avg_qty = 0, "
-            "sid_shop_item_rolling_7d_mode_qty = 0, "
-            "sid_shop_item_rolling_7d_median_qty = 0"
-        )
-        run_query(sql)
-        sql = (
-            "UPDATE sid_addl_expand_qty_stats "
-            "SET sid_shop_item_expand_qty_max = 0, "
-            "sid_shop_item_expand_qty_mean = 0, "
-            "sid_shop_item_expand_qty_min = 0, "
-            "sid_shop_item_expand_qty_mode = 0, "
-            "sid_shop_item_expand_qty_median = 0"
-        )
-        run_query(sql)
-        sql = (
-            "UPDATE sid_addl_expand_bw_sales_stats "
-            "SET sid_shop_item_date_avg_gap_bw_sales = 0, "
-            "sid_shop_item_date_max_gap_bw_sales = 0, "
-            "sid_shop_item_date_min_gap_bw_sales = 0, "
-            "sid_shop_item_date_mode_gap_bw_sales = 0, "
-            "sid_shop_item_date_median_gap_bw_sales = 0, "
-            "sid_shop_item_date_std_gap_bw_sales = 0"
-        )
-        run_query(sql)
-        sql = (
-            "UPDATE sid_addl_n_sale_dts "
-            "SET sid_shop_item_cnt_sale_dts_last_7d = 0, "
-            "sid_shop_item_cnt_sale_dts_last_30d = 0, "
-            "sid_shop_item_cnt_sale_dts_before_day = 0"
-        )
-        run_query(sql)
-        sql = (
-            "UPDATE sid_addl_expand_qty_cv_sqrd "
-            "SET sid_expand_cv2_of_qty = 0"
-        )
-        run_query(sql)
+        # sql = (
+        #     "UPDATE sid_addl_roll_qty_stats "
+        #     "SET sid_shop_item_rolling_7d_max_qty = 0, "
+        #     "sid_shop_item_rolling_7d_min_qty = 0, "
+        #     "sid_shop_item_rolling_7d_avg_qty = 0, "
+        #     "sid_shop_item_rolling_7d_mode_qty = 0, "
+        #     "sid_shop_item_rolling_7d_median_qty = 0"
+        # )
+        # run_query(sql)
+        # sql = (
+        #     "UPDATE sid_addl_expand_qty_stats "
+        #     "SET sid_shop_item_expand_qty_max = 0, "
+        #     "sid_shop_item_expand_qty_mean = 0, "
+        #     "sid_shop_item_expand_qty_min = 0, "
+        #     "sid_shop_item_expand_qty_mode = 0, "
+        #     "sid_shop_item_expand_qty_median = 0"
+        # )
+        # run_query(sql)
+        # sql = (
+        #     "UPDATE sid_addl_expand_bw_sales_stats "
+        #     "SET sid_shop_item_date_avg_gap_bw_sales = 0, "
+        #     "sid_shop_item_date_max_gap_bw_sales = 0, "
+        #     "sid_shop_item_date_min_gap_bw_sales = 0, "
+        #     "sid_shop_item_date_mode_gap_bw_sales = 0, "
+        #     "sid_shop_item_date_median_gap_bw_sales = 0, "
+        #     "sid_shop_item_date_std_gap_bw_sales = 0"
+        # )
+        # run_query(sql)
+        # sql = (
+        #     "UPDATE sid_addl_n_sale_dts "
+        #     "SET sid_shop_item_cnt_sale_dts_last_7d = 0, "
+        #     "sid_shop_item_cnt_sale_dts_last_30d = 0, "
+        #     "sid_shop_item_cnt_sale_dts_before_day = 0"
+        # )
+        # run_query(sql)
+        # sql = (
+        #     "UPDATE sid_addl_expand_qty_cv_sqrd "
+        #     "SET sid_expand_cv2_of_qty = 0"
+        # )
+        # run_query(sql)
         # SKIPPING THE QUERY BELOW FOR NOW, AS THOSE COLUMNS CAN BE SET TO 0'S LATER
         # sql = (
         #     "UPDATE addl_shop_item_dates "
