@@ -12,7 +12,7 @@ Usage: run from the command line as such:
     # Run one or more queries to create new features or modify existing
     # features or tables
     python modify_features.py query
-    
+
 """
 
 import argparse
@@ -311,6 +311,7 @@ def main():
                 'sid_expand_qty_stats', 'sid_roll_qty_stats', 'sid_expand_bw_sales_stats']
         for sid_table in sid_tables:
             sql_str = (
+                "DROP TABLE IF EXISTS {0}; "
                 "CREATE TABLE {0} (LIKE {1} INCLUDING INDEXES)"
             )
             sql = SQL(sql_str).format(
@@ -400,6 +401,7 @@ def main():
             run_query(sql)
 
         # change null values in newly created values
+        # SKIPPING THE 5 QUERIES BELOW FOR NOW, AS THOSE COLUMNS CAN BE SET TO 0'S LATER
         sql = (
             "UPDATE sid_addl_roll_qty_stats "
             "SET sid_shop_item_rolling_7d_max_qty = 0, "
