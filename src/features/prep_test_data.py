@@ -47,7 +47,7 @@ TO DO:
             - example:
                  >>> s = "ALTER a b c; ALTER d e f"
                  >>> [("ALTER"+x).strip() for x in s.split("ALTER")][1:]
-                 ['ALTER a b c;', 'ALTER d e f;']
+                 ['ALTER a b c;', 'ALTER d e f']
         - create separate connections for item-date, shop-date and shop-item-date queries
     - need to add a progress monitor to report percentage of queries done
     - need to produce some type of summary of predictions for each day before proceeding
@@ -177,6 +177,7 @@ import os
 from pathlib import Path
 import platform
 import sys
+import threading
 
 import boto3
 from botocore.exceptions import ClientError
@@ -189,6 +190,103 @@ sys.path.insert(1, os.path.join(sys.path[0], ".."))
 from utils.config import config
 from utils.rds_instance_mgmt import start_instance, stop_instance
 from utils.timer import Timer
+from queries import lag_query, all_queries_str
+
+# create database connection in the __init__ method
+# thread_function completes the SQL commands
+# run function calls thread_function with individual parts of the list of SQL queries
+
+class multi_thread_db_class(threading.Thread):
+    def __init__(self, group=None, target=None, name=None, args=(), kwargs=None):
+        """Create database connection for each thread separately.
+
+        Parameters:
+        -----------
+        args : tuple
+            SQL queries dedicated to the thread
+        kwargs : dictionary
+            query parameters to submit to cur.execute() method
+        """
+        super().__init__()
+        self.args = args
+        self.kwargs = kwargs
+
+        self.stop_requested = threading.Event()
+        self.exception = None
+
+        try:
+            # read connection parameters
+            db_params = config(section="postgresql")
+
+            # connect to the PostgreSQL server
+            self.conn = psycopg2.connect(**db_params)
+            self.conn.autocommit = True
+            for line in self.conn.notices:
+                logging.debug(line.strip("\n"))
+            logging.info("Connected to the PostgreSQL database.")
+
+        except (Exception, psycopg2.DatabaseError) as e:
+            logging.exception("Exception occurred during database connection.")
+            self.exception = e
+
+    @Timer(logger=logging.info)
+    def execute_query(self, sql):
+        """ Execute individual SQL query.
+
+        Parameters:
+        -----------
+        sql : str
+            SQL query to be executed
+        """
+        try:
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
+            with self.conn.cursor() as cur:
+                cur.execute(sql, self.kwargs)
+            for line in self.conn.notices:
+                logging.debug(line.strip("\n"))
+        except (Exception, psycopg2.DatabaseError) as e:
+            logging.exception(
+                "Exception occurred in execute_query function. "
+                f"Query that generated exception: {sql}"
+            )
+            self.close_db_conn()
+            self.exception = e
+
+    def close_db_conn(self):
+        """ Close PostgreSQL database connection."""
+        if self.conn is not None:
+            self.conn.close()
+            logging.info("Database connection closed.")
+
+    def run(self):
+        """ Method representing the thread’s activity, which is to loop over
+        SQL queries assigned to the thread and call the execute_query() function
+        for each query, closing the database connection after all queries are done.
+        """
+        try:
+            i = 0
+            # run execute_query on each query in list dedicated to thread
+            while i < len(self.args):
+                # do your thread thing here
+                query = self.args[i]
+                self.execute_query(query)
+                i += 1
+
+            global n_threads_finished
+            n_threads_finished += 1
+
+        except (Exception, psycopg2.DatabaseError) as e:
+            logging.exception("Exception occurred in run() function.")
+            self.exception = e
+
+        finally:
+            self.close_db_conn()
+
+    def stop(self):
+        """ Set the event to signal stop. """
+        self.stop_requested.set()
 
 
 def valid_day(s):
@@ -239,11 +337,12 @@ class single_thread_db_class:
             self.conn = psycopg2.connect(**db_params)
             self.conn.autocommit = True
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
             logging.info("Connected to the PostgreSQL database.")
 
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred during database connection.")
+            sys.exit(1)
 
     def close_db_conn(self):
         """ Close PostgreSQL database connection."""
@@ -319,16 +418,20 @@ class single_thread_db_class:
         in the sales_cleaned table.
         """
         try:
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     "DELETE FROM sales_cleaned WHERE sale_date >= make_date(2015,11,1)"
                 )
                 cur.execute(sql)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred in delete_from_sales_cleaned function.")
+            logging.exception(
+                "Exception occurred in delete_from_sales_cleaned function."
+            )
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -349,7 +452,9 @@ class single_thread_db_class:
         This step must precede insertion of features into those tables.
         """
         try:
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     "DELETE FROM item_dates "
@@ -361,7 +466,7 @@ class single_thread_db_class:
                 )
                 cur.execute(sql)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred in delete_test_prd function.")
             if self.conn is not None:
@@ -488,7 +593,9 @@ class single_thread_db_class:
             sid_col_list = list(set(sid_new_col_list) & set(sid_main_col_list))
             sid_cols_to_select = ", ".join(sid_col_list)
 
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     f"INSERT INTO item_dates ({id_cols_to_select}) "
@@ -502,7 +609,7 @@ class single_thread_db_class:
                 )
                 cur.execute(sql)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred in append_features function.")
             if self.conn is not None:
@@ -532,7 +639,9 @@ class single_thread_db_class:
         """
         try:
             if first_day:
-                del self.conn.notices[:] # clear the notices list before executing next query
+                del self.conn.notices[
+                    :
+                ]  # clear the notices list before executing next query
                 with self.conn.cursor() as cur:
                     sql = (
                         "DROP TABLE IF EXISTS daily_sid_predictions; "
@@ -541,11 +650,13 @@ class single_thread_db_class:
                     )
                     cur.execute(sql)
                 for line in self.conn.notices:
-                    logging.debug(line.strip('\n'))
+                    logging.debug(line.strip("\n"))
 
             # import CSV data to created table
             # predictions for different days are appended to existing table
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
                     f"SELECT aws_s3.table_import_from_s3('daily_sid_predictions', '', '(format csv, header)', "
@@ -555,9 +666,11 @@ class single_thread_db_class:
                 )
                 cur.execute(sql)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred in import_preds_into_new_table function.")
+            logging.exception(
+                "Exception occurred in import_preds_into_new_table function."
+            )
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -588,7 +701,9 @@ class single_thread_db_class:
         """
         try:
             if first_day:
-                del self.conn.notices[:] # clear the notices list before executing next query
+                del self.conn.notices[
+                    :
+                ]  # clear the notices list before executing next query
                 with self.conn.cursor() as cur:
                     sql_str = (
                         "ALTER TABLE daily_sid_predictions "
@@ -598,10 +713,12 @@ class single_thread_db_class:
                     sql = SQL(sql_str).format(Identifier(model_col))
                     cur.execute(sql)
                 for line in self.conn.notices:
-                    logging.debug(line.strip('\n'))
+                    logging.debug(line.strip("\n"))
 
             # predictions are joined with existing rows on shop-item-date
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql_str = (
                     "CREATE TEMP TABLE new_model_preds (shop_id smallint NOT NULL, "
@@ -619,9 +736,11 @@ class single_thread_db_class:
                 )
                 cur.execute(sql)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
-            logging.exception("Exception occurred in import_preds_into_existing_table function.")
+            logging.exception(
+                "Exception occurred in import_preds_into_existing_table function."
+            )
             if self.conn is not None:
                 self.conn.close()
                 logging.info("Database connection closed.")
@@ -647,7 +766,7 @@ class single_thread_db_class:
             Model number (number of the model currently being worked on)
         """
         row_and_col_cts_can_be_used = True
-        del self.conn.notices[:] # clear the notices list before executing next query
+        del self.conn.notices[:]  # clear the notices list before executing next query
         with self.conn.cursor() as cur:
             sql = (
                 "WITH cols AS ("
@@ -678,7 +797,7 @@ class single_thread_db_class:
                     "in daily_sid_predictions table:"
                 )
         for line in self.conn.notices:
-            logging.debug(line.strip('\n'))
+            logging.debug(line.strip("\n"))
 
         if row_and_col_cts_can_be_used:
             # there should be 214,200 rows per day
@@ -708,7 +827,9 @@ class single_thread_db_class:
             List of parameters to pass to execute method
         """
         try:
-            del self.conn.notices[:] # clear the notices list before executing next query
+            del self.conn.notices[
+                :
+            ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql_str = (
                     "WITH day_total AS ("
@@ -772,7 +893,7 @@ class single_thread_db_class:
                 sql = SQL(sql_str).format(Identifier(model_col))
                 cur.execute(sql, params)
             for line in self.conn.notices:
-                logging.debug(line.strip('\n'))
+                logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred in agg_preds function.")
             if self.conn is not None:
@@ -832,7 +953,7 @@ def main():
             "does not surpass Nov 30th."
         )
 
-    fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
+    fmt = "%(threadName)-9s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
     log_dir = Path.cwd().joinpath("logs")
     path = Path(log_dir)
@@ -891,9 +1012,9 @@ def main():
     # create database connection
     db = single_thread_db_class(is_aws, log_fname)
 
-    for i, curr_date in enumerate(
-        [args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)], 1
-    ):
+    for curr_date in [
+        args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)
+    ]:
 
         curr_date_str = datetime.datetime.strftime(curr_date, format="%Y-%m-%d")
         logging.info(f"Starting to run predictions for {curr_date_str}...")
@@ -912,6 +1033,66 @@ def main():
         # that leaves shops and items tables, which remain constant/unchanged
 
         # QUERIES TO CREATE _NEW_DAY TABLES AND THE FEATURES IN THEM MOVED TO QUERIES.PY
+        three_strings = [
+            ("DROP TABLE" + x).strip() for x in all_queries_str.split("DROP TABLE")
+        ][1:]
+        three_lists = [
+            [
+                ("ALTER" + x).strip() if not x.startswith("DROP") else x.strip()
+                for x in s.split("ALTER")
+            ]
+            for s in three_strings
+        ]
+
+        threads = [
+            multi_thread_db_class(
+                args=(three_lists[0].insert(0, lag_query)), kwargs=params
+            ),
+            multi_thread_db_class(args=(three_lists[1]), kwargs=params),
+            multi_thread_db_class(args=(three_lists[2]), kwargs=params),
+        ]
+        for t in threads:
+            t.start()
+
+        # main thread looks at the status of all threads
+        n_threads_finished = 0
+        try:
+            # while True:
+            while n_threads_finished < 3:
+                for t in threads:
+                    if t.exception:
+                        # there was an error in a thread - raise it in main thread too
+                        # this will stop the loop
+                        raise t.exception
+                time.sleep(0.5)
+
+        except Exception as e:
+            # handle exceptions any way you like, or don't
+            # This includes exceptions in main thread as well as those in other threads
+            # (because of "raise t.exception" above)
+
+            # so, as soon as an exception is raised in one of the threads, the try
+            # clause is ended, and except and finally clauses are run, which means
+            # any thread without an exception is stopped
+            logging.exception("Exception encountered in main or another thread.")
+
+            # copy log file to S3 bucket if running script on a EC2 instance
+            if is_aws:
+                try:
+                    response = s3_client.upload_file(
+                        f"./logs/{log_fname}", "my-ec2-logs", log_fname
+                    )
+                    logging.info("Log file was successfully copied to S3.")
+                except ClientError as e:
+                    logging.exception("Log file was not copied to S3.")
+
+            sys.exit(1)  # finally clause will execute regardless of exception, so
+            # threads will be stopped before exiting Python.
+
+        finally:
+            for t in threads:
+                # threads will know how to clean up when stopped
+                t.stop()
 
         col_names_csv_path = csv_dir.joinpath(cols_csv_fname)
         # RUN SUMMARY QUERY TO GENERATE COLUMN LIST FOR THE TABLES TO BE JOINED
