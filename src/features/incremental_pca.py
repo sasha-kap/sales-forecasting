@@ -42,11 +42,11 @@ import json
 import logging
 import os
 from pathlib import Path
-import pickle as pk
 import platform
 import sys
 import time
 
+import awswrangler as wr
 import boto3
 from botocore.exceptions import ClientError
 from dateutil.relativedelta import relativedelta
@@ -546,6 +546,8 @@ def pca(
         print("Starting third iteration over CSVs - IncrementalPCA transform...")
         pca_transformed = None
         shape_list = list()
+        overall_shape = (0, None)
+        overall_nbytes = 0
         global_idx = -1
         for csv_file in csv_list:
             csv_body = s3_client.get_object(Bucket=bucket, Key=csv_file).get("Body")
@@ -596,41 +598,70 @@ def pca(
                     shape_list.append(tx_chunk.shape)
                     pca_transformed = np.vstack((pca_transformed, tx_chunk))
 
+                if pca_transformed.nbytes > 100_000_000:
+                    # convert the array to pandas dataframe and upload it to S3
+                    # as a parquet file/dataset
+                    wr.s3.to_parquet(
+                        df=pd.DataFrame(pca_transformed, columns=[
+                            "shop_id", "item_id", "sale_date"] +
+                            [f"pc{x}" for x in range(1, pca_transformed.shape[1]-2)]
+                        ),
+                        path="s3://sales-demand-data/parquet_dataset/",
+                        index=False,
+                        dataset=True,
+                        mode="append",
+                        partition_cols=["sale_date"],
+                    )
+
+                    # also update combined shape of PCA-transformed data
+                    overall_shape = (overall_shape[0] + pca_transformed.shape[0],
+                    pca_transformed.shape[1])
+
+                    # also update total bytes consumed by PCA-transformed data
+                    overall_nbytes += pca_transformed.nbytes
+
+                    # also, reset pca_transformed to None
+                    pca_transformed = None
+
                 global_idx = index
 
-        print(f"Final shape of PCA-transformed data: {pca_transformed.shape}")
+        if pca_transformed is not None:
+            # convert the array to pandas dataframe and upload it to S3
+            # as a parquet file/dataset
+            wr.s3.to_parquet(
+                df=pd.DataFrame(pca_transformed, columns=[
+                    "shop_id", "item_id", "sale_date"] +
+                    [f"pc{x}" for x in range(1, pca_transformed.shape[1]-2)]
+                ),
+                path="s3://sales-demand-data/parquet_dataset/",
+                index=False,
+                dataset=True,
+                mode="append",
+                partition_cols=["sale_date"],
+            )
+
+            # also update combined shape of PCA-transformed data
+            overall_shape = (overall_shape[0] + pca_transformed.shape[0],
+            pca_transformed.shape[1])
+
+            # also update total bytes consumed by PCA-transformed data
+            overall_nbytes += pca_transformed.nbytes
+
+        print(f"Final shape of PCA-transformed data: {overall_shape}")
         print(
-            f"Total bytes consumed by elements of PCA-transformed array: {pca_transformed.nbytes}"
+            f"Total bytes consumed by elements of PCA-transformed array: {overall_nbytes:,}"
         )
 
         shape_arr = np.array(shape_list)
         print(f"Size of shape_arr: {shape_arr.shape}")
 
-        problem_with_output = False
         if np.max(shape_arr[:, 1]) != np.min(shape_arr[:, 1]):
-            logging.error("Different chunks have different counts of columns!!!")
-            problem_with_output = True
-        if (np.sum(shape_arr[:, 0]), np.min(shape_arr[:, 1])) != pca_transformed.shape:
-            logging.error(
+            logging.debug("Different chunks have different counts of columns!!!")
+        if (np.sum(shape_arr[:, 0]), np.min(shape_arr[:, 1])) != overall_shape:
+            logging.debug(
                 "Final shape of PCA-transformed data does not "
                 "match the combined shape of individual chunks!!!"
             )
-            problem_with_output = True
-
-        if not problem_with_output:
-            transformed_data = io.BytesIO()
-            pk.dump(pca_transformed, transformed_data)
-            my_array_data.seek(0)
-            try:
-                key = f"pca_transformed_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')}.pkl"
-                response = s3_client.put_object(
-                    Body=transformed_data, Bucket="sales-demand-data", Key=key
-                )
-                logging.info("PCA-transformed data successfully uploaded to S3.")
-            except ClientError:
-                logging.exception(
-                    "Exception occurred during writing PCA-transformed data to S3."
-                )
 
             # save transformed data array to npy file on S3
             # IS IT OKAY TO BUILD UP A LARGE COMPLETE PCA_TRANSFORMED ARRAY?
@@ -765,6 +796,7 @@ def main():
         logging.getLogger("urllib3").setLevel(logging.CRITICAL)
         # also, suppress irrelevant logging by matplotlib
         logging.getLogger("matplotlib").setLevel(logging.CRITICAL)
+        logging.getLogger("awswrangler").setLevel(logging.DEBUG)
 
         # Check if code is being run on EC2 instance (vs locally)
         my_user = os.environ.get("USER")
