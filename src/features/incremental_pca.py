@@ -575,7 +575,7 @@ def pca(
                 chunk_sub = chunk.sample(frac=frac, random_state=42).sort_values(
                     by=["shop_id", "item_id", "sale_date"]
                 )
-                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date"]].values
+                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"]].values
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
                 scaled_data = scaler.transform(
@@ -603,8 +603,8 @@ def pca(
                     # as a parquet file/dataset
                     wr.s3.to_parquet(
                         df=pd.DataFrame(pca_transformed, columns=[
-                            "shop_id", "item_id", "sale_date"] +
-                            [f"pc{x}" for x in range(1, pca_transformed.shape[1]-2)]
+                            "shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"] +
+                            [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]
                         ),
                         path="s3://sales-demand-data/parquet_dataset/",
                         index=False,
@@ -630,8 +630,8 @@ def pca(
             # as a parquet file/dataset
             wr.s3.to_parquet(
                 df=pd.DataFrame(pca_transformed, columns=[
-                    "shop_id", "item_id", "sale_date"] +
-                    [f"pc{x}" for x in range(1, pca_transformed.shape[1]-2)]
+                    "shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"] +
+                    [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]
                 ),
                 path="s3://sales-demand-data/parquet_dataset/",
                 index=False,
