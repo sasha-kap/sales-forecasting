@@ -191,7 +191,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
         logging.exception("PCA explained variance plot file was not copied to S3.")
 
 
-def preprocess_chunk(df, index, scale_bins=False):
+def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
     """Perform necessary preprocessing steps on each chunk of CSV data prior
     to passing data to StandardScaler.
 
@@ -199,6 +199,9 @@ def preprocess_chunk(df, index, scale_bins=False):
     -----------
     df : DataFrame
         Chunk of CSV data
+    null_col_dict : dict
+        Dictionary of columns that have null values in CSVs, with their
+        data types that need to be assigned after nulls are filled with 0's
     index : int
         Chunk counter
     scale_bins : bool
@@ -230,6 +233,15 @@ def preprocess_chunk(df, index, scale_bins=False):
         + ["shop_id", "item_id", "sale_date"]
     )
     df.drop(cols_to_drop, axis=1, inplace=True)
+
+    # fill columns with null values and change data type from float to the type
+    # previously determined for each column
+    for col, dtype_str in null_col_dict.items():
+        # sid_shop_item_qty_sold_day is already dropped above, so it can be excluded
+        # from this step
+        if ~col.endswith("_qty_sold_day"):
+            df[col].fillna(0, inplace=True)
+            df[col] = df[col].astype(dtype_str)
 
     # fix data type of some columns
     df["d_modern_education_share"] = df["d_modern_education_share"].apply(
@@ -373,8 +385,46 @@ def pca(
 
     with open("./features/pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
-        pd_types.pop("sale_date")
+
+    del pd_types["sale_date"] # remove sale_date as it will be included in parse_dates=
+
+    # change types of integer columns to floats (float32) for columns that contain nulls
+    # change the dictionary values, while also extracting the key-value pairs and
+    # putting them into a separate dictionary to pass to the preprocess_chunk function
+    # so columns can be changed to appropriate types after null values are filled.
+    null_col_dict = dict()
+    null_col_list = [
+    'sid_shop_cat_qty_sold_last_7d', 'sid_cat_sold_at_shop_before_day_flag',
+    'sid_shop_item_rolling_7d_max_qty', 'sid_shop_item_rolling_7d_min_qty',
+    'sid_shop_item_rolling_7d_avg_qty', 'sid_shop_item_rolling_7d_mode_qty',
+    'sid_shop_item_rolling_7d_median_qty', 'sid_shop_item_expand_qty_max',
+    'sid_shop_item_expand_qty_mean', 'sid_shop_item_expand_qty_min',
+    'sid_shop_item_expand_qty_mode', 'sid_shop_item_expand_qty_median',
+    'sid_shop_item_date_avg_gap_bw_sales', 'sid_shop_item_date_max_gap_bw_sales',
+    'sid_shop_item_date_min_gap_bw_sales', 'sid_shop_item_date_mode_gap_bw_sales',
+    'sid_shop_item_date_median_gap_bw_sales', 'sid_shop_item_date_std_gap_bw_sales',
+    'sid_shop_item_cnt_sale_dts_last_7d', 'sid_shop_item_cnt_sale_dts_last_30d',
+    'sid_shop_item_cnt_sale_dts_before_day', 'sid_expand_cv2_of_qty',
+    'sid_shop_item_days_since_first_sale', 'sid_days_since_max_qty_sold',
+    'sid_shop_item_qty_sold_day', 'sid_shop_item_first_month',
+    'sid_shop_item_last_qty_sold', 'sid_shop_item_first_week',
+    'sid_shop_item_expanding_adi', 'sid_shop_item_date_diff_bw_last_and_prev_qty',
+    'sid_shop_item_days_since_prev_sale', 'sid_shop_item_qty_sold_7d_ago',
+    'sid_qty_median_abs_dev', 'sid_coef_var_price', 'sid_shop_item_qty_sold_2d_ago',
+    'sid_qty_mean_abs_dev', 'sid_shop_item_qty_sold_1d_ago',
+    'sid_shop_item_qty_sold_3d_ago'
+    ]
+    for col in null_col_list:
+        if col in ['sid_cat_sold_at_shop_before_day_flag', 'sid_shop_item_first_month', 'sid_shop_item_first_week']:
+            null_col_dict[col] = 'uint8'
+        else:
+            null_col_dict[col] = pd_types[col]
+        pd_types[col] = 'float32'
+
     # change types of binary features to 'uint8'
+    # do not include the three sid_ features in bin_features here, but add them to the
+    # null_col_dict dictionary with uint8 type, which will change the type to uint8
+    # after null values are filled in
     bin_features = (
         "d_holiday",
         "d_is_weekend",
@@ -388,9 +438,6 @@ def pca(
         "s_online_store",
         "sd_shop_first_month",
         "sd_shop_first_week",
-        "sid_cat_sold_at_shop_before_day_flag",
-        "sid_shop_item_first_month",
-        "sid_shop_item_first_week",
     )
     pd_types = {k: "uint8" if v in bin_features else v for k, v in pd_types.items()}
 
@@ -468,6 +515,7 @@ def pca(
                         chunk.sample(frac=frac, random_state=42).sort_values(
                             by=["shop_id", "item_id", "sale_date"]
                         ),
+                        null_col_dict,
                         index,
                         scale_bins=scale_bins,
                     )
@@ -515,6 +563,7 @@ def pca(
                     chunk.sample(frac=frac, random_state=42).sort_values(
                         by=["shop_id", "item_id", "sale_date"]
                     ),
+                    null_col_dict,
                     index,
                     scale_bins=scale_bins,
                 )
@@ -579,7 +628,7 @@ def pca(
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
                 scaled_data = scaler.transform(
-                    preprocess_chunk(chunk_sub, index, scale_bins=scale_bins)
+                    preprocess_chunk(chunk_sub, null_col_dict, index, scale_bins=scale_bins)
                 )
                 if not scale_bins:
                     scaled_data = np.hstack(
