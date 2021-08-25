@@ -937,6 +937,19 @@ all_queries_str = (
     "SET sid_cat_sold_at_shop_before_day_flag = 1 "
     "FROM scq "
     "WHERE nd.shop_id = scq.shop_id AND nd.sid_item_category_id = scq.sid_item_category_id; "
+    # 'sid_shop_cat_qty_sold_last_7d' : 'int16', (this int16 value is based on smallint type of PSQL column)
+    "ALTER TABLE sid_new_day "
+    "ADD COLUMN sid_shop_cat_qty_sold_last_7d smallint default 0; "
+    "WITH scq AS ("
+    "SELECT shop_id, sid_item_category_id, "
+    "sum(sid_shop_item_qty_sold_day) AS sid_shop_cat_qty_sold_last_7d "
+    "FROM shop_item_dates "
+    "WHERE sale_date >= %(curr_date)s - 7 "
+    "GROUP BY shop_id, sid_item_category_id) "
+    "UPDATE sid_new_day nd "
+    "SET sid_shop_cat_qty_sold_last_7d = scq.sid_shop_cat_qty_sold_last_7d "
+    "FROM scq "
+    "WHERE nd.shop_id = scq.shop_id AND nd.sid_item_category_id = scq.sid_item_category_id; "
     # add feature counting days since “first day of availability of item at shop”
     # (days since the LATTER OF the first day the item was sold anywhere AND the
     # first day that the shop sold any item)
