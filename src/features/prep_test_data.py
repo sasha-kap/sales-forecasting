@@ -74,6 +74,7 @@ TO DO:
     - investigate values of this feature by category-day during the first month
       that an item is on sale (i.e., from day 1 through day 30)
     - not sure if feasible to calculate this feature for new shop-items without having price
+    - REMOVED THIS FEATURE sid_coef_var_price (dropped it in incremental_pca and commented out in queries.py)
 - look into parallelizing the SQL code via multiple connections/cursors
     - use autocommit (conn.autocommit = True)
     - threading
@@ -196,7 +197,7 @@ from queries import lag_query, all_queries_str
 # thread_function completes the SQL commands
 # run function calls thread_function with individual parts of the list of SQL queries
 
-class multi_thread_db_class(threading.Thread):
+class MultiThreadDBClass(threading.Thread):
     def __init__(self, group=None, target=None, name=None, args=(), kwargs=None):
         """Create database connection for each thread separately.
 
@@ -271,6 +272,7 @@ class multi_thread_db_class(threading.Thread):
             while i < len(self.args):
                 # do your thread thing here
                 query = self.args[i]
+                logging.debug(f"Query to be executed: {query}")
                 self.execute_query(query)
                 i += 1
 
@@ -313,7 +315,7 @@ def valid_day(s):
         raise argparse.ArgumentTypeError(msg)
 
 
-class single_thread_db_class:
+class SingleThreadDBClass:
     def __init__(self, is_aws, log_fname):
         """Create database connection.
 
@@ -1010,7 +1012,7 @@ def main():
     logging.info(f"Starting to run predictions for model {args.modelnum}...")
 
     # create database connection
-    db = single_thread_db_class(is_aws, log_fname)
+    db = SingleThreadDBClass(is_aws, log_fname)
 
     for curr_date in [
         args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)
@@ -1045,11 +1047,11 @@ def main():
         ]
 
         threads = [
-            multi_thread_db_class(
+            MultiThreadDBClass(
                 args=(three_lists[0].insert(0, lag_query)), kwargs=params
             ),
-            multi_thread_db_class(args=(three_lists[1]), kwargs=params),
-            multi_thread_db_class(args=(three_lists[2]), kwargs=params),
+            MultiThreadDBClass(args=(three_lists[1]), kwargs=params),
+            MultiThreadDBClass(args=(three_lists[2]), kwargs=params),
         ]
         for t in threads:
             t.start()
