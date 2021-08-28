@@ -155,7 +155,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
 
     # get datetime value of first_mon
     m = datetime.datetime.strptime(
-        first_mon.replace("shops_", "").split(".")[0], "%y_%m"
+        first_mon.replace("shops_", "").replace("_addl", "").split(".")[0], "%y_%m"
     )
     # add one month
     m = m + relativedelta(months=1)
@@ -191,7 +191,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
         logging.exception("PCA explained variance plot file was not copied to S3.")
 
 
-def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
+def preprocess_chunk(df, null_col_dict, index):
     """Perform necessary preprocessing steps on each chunk of CSV data prior
     to passing data to StandardScaler.
 
@@ -204,16 +204,13 @@ def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
         data types that need to be assigned after nulls are filled with 0's
     index : int
         Chunk counter
-    scale_bins : bool
-        Whether binary columns are to be included in returned dataframe and
-        passed to StandardScaler (default: False)
 
     Returns:
     --------
     DataFrame
         Dataframe with preprocessed features
     """
-    # drop string columns, quantty sold columns that include quantity from current day,
+    # drop string columns, quantity sold columns that include quantity from current day,
     # and row identification columns (shop, item, date)
     # also drop sid_coef_var_price, which cannot be reliably constructed for test data
     cols_to_drop = (
@@ -239,7 +236,7 @@ def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
     for col, dtype_str in null_col_dict.items():
         # sid_shop_item_qty_sold_day is already dropped above, so it can be excluded
         # from this step
-        if ~col.endswith("_qty_sold_day"):
+        if not col.endswith("_qty_sold_day") and col != "sid_coef_var_price":
             df[col].fillna(0, inplace=True)
             df[col] = df[col].astype(dtype_str)
 
@@ -277,39 +274,39 @@ def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
         "Чистые",
         "Книги",
     ]
-    prefix = "i_item_cat_broad_"
+    prefix = "i_item_cat_broad"
     df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
-    cols = df_cats.columns.union([prefix + x for x in broad_cats])
+    cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
     df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     mons_of_first_sale = [x for x in range(13)]
-    prefix = "i_item_first_mon_"
+    prefix = "i_item_first_mon"
     df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
-    cols = df_first_months.columns.union([prefix + str(x) for x in mons_of_first_sale])
+    cols = df_first_months.columns.union([prefix + "_" + str(x) for x in mons_of_first_sale])
     df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     years = [2013, 2014, 2015]
-    prefix = "d_year_"
+    prefix = "d_year"
     df_years = pd.get_dummies(df.d_year, prefix=prefix)
-    cols = df_years.columns.union([prefix + str(x) for x in years])
+    cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
     df_years = df_years.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     dow = [x for x in range(7)]
-    prefix = "d_day_of_week_"
+    prefix = "d_day_of_week"
     df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
-    cols = df_dow.columns.union([prefix + str(x) for x in dow])
+    cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
     df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     months = [x for x in range(12)]
-    prefix = "d_month_"
+    prefix = "d_month"
     df_months = pd.get_dummies(df.d_month, prefix=prefix)
-    cols = df_months.columns.union([prefix + str(x) for x in months])
+    cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
     df_months = df_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
 
     quarters = [x for x in range(1, 5)]
-    prefix = "d_quarter_"
+    prefix = "d_quarter"
     df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
-    cols = df_quarters.columns.union([prefix + str(x) for x in quarters])
+    cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
     df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype('uint8')
     # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
 
@@ -344,9 +341,6 @@ def preprocess_chunk(df, null_col_dict, index, scale_bins=False):
             f"{non_zero_cts}")
         sys.exit(1)
 
-    # drop binary columns if they are not to be scaled with StandardScaler
-    if not scale_bins:
-        return df.select_dtypes(exclude="uint8")
     return df
 
 
@@ -439,7 +433,13 @@ def pca(
         "sd_shop_first_month",
         "sd_shop_first_week",
     )
-    pd_types = {k: "uint8" if v in bin_features else v for k, v in pd_types.items()}
+    pd_types = {k: "uint8" if k in bin_features else v for k, v in pd_types.items()}
+
+    select_dtypes_params = {'include': None, 'exclude': None}
+    if scale_bins:
+        select_dtypes_params['include'] = 'number' # all numeric types
+    else:
+        select_dtypes_params['exclude'] = 'uint8' # binary columns
 
     # reader1, reader2, reader3 = tee(
     #     chain.from_iterable(
@@ -517,8 +517,9 @@ def pca(
                         ),
                         null_col_dict,
                         index,
-                        scale_bins=scale_bins,
+                        # scale_bins=scale_bins,
                     )
+                    .select_dtypes(**select_dtypes_params)
                 )
                 global_idx = index
             except ValueError:
@@ -558,29 +559,48 @@ def pca(
             # sample the chunk again
             # again perform the same necessary transformations
             # pass transformed features (and all other features that will be going into PCA) to scaler.transform()
-            scaled_data = scaler.transform(
-                preprocess_chunk(
-                    chunk.sample(frac=frac, random_state=42).sort_values(
-                        by=["shop_id", "item_id", "sale_date"]
-                    ),
-                    null_col_dict,
-                    index,
-                    scale_bins=scale_bins,
-                )
+            preprocessed_chunk = preprocess_chunk(
+                chunk.sample(frac=frac, random_state=42).sort_values(
+                    by=["shop_id", "item_id", "sale_date"]
+                ),
+                null_col_dict,
+                index,
+                # scale_bins=scale_bins,
             )
+            scaled_data = scaler.transform(
+                preprocessed_chunk.select_dtypes(**select_dtypes_params)
+            )
+            # print(
+            #     "Columns in chunk after preprocessed_chunk.select_dtypes() are: "
+            #     f"{preprocessed_chunk.select_dtypes(**select_dtypes_params).columns.to_list()}."
+            # )
+            # print(
+            #     "Number of columns in chunk after preprocessed_chunk.select_dtypes() is: "
+            #     f"{len(preprocessed_chunk.select_dtypes(**select_dtypes_params).columns.to_list())} "
+            #     f"and shape of scaled_data is {scaled_data.shape}."
+            # )
             # pass standard-scaled data (plus binary features if they were not scaled) to PCA partial fit
             if not scale_bins:
                 scaled_data = np.hstack(
                     (
                         scaled_data,
                         (
-                            chunk.sample(frac=frac, random_state=42)
-                            .sort_values(by=["shop_id", "item_id", "sale_date"])
+                            preprocessed_chunk
                             .select_dtypes(include="uint8")
                             .to_numpy()
                         ),
                     )
                 )
+            # print(
+            #     "Columns in chunk with only binary columns are: "
+            #     f"{preprocessed_chunk.select_dtypes(include='uint8').columns.to_list()}"
+            # )
+            # print(
+            #     "Shape of chunk after preprocessed_chunk.select_dtypes(include='uint8') is: "
+            #     f"{preprocessed_chunk.select_dtypes(include='uint8').to_numpy().shape} and "
+            #     "shape of entire array passed to sklearn_pca.partial_fit() is "
+            #     f"{scaled_data.shape}."
+            # )
             sklearn_pca.partial_fit(scaled_data)
             global_idx = index
 
@@ -624,17 +644,32 @@ def pca(
                 chunk_sub = chunk.sample(frac=frac, random_state=42).sort_values(
                     by=["shop_id", "item_id", "sale_date"]
                 )
-                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"]].values
+                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"]].copy()
+                # fill in null values of sid_shop_item_qty_sold_day as this data is not passed through
+                # the preprocess_chunk function
+                id_cols_arr["sid_shop_item_qty_sold_day"].fillna(0, inplace=True)
+                id_cols_arr["sid_shop_item_qty_sold_day"] = id_cols_arr["sid_shop_item_qty_sold_day"].astype('int16')
+                id_cols_arr = id_cols_arr.to_numpy()
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
+                preprocessed_chunk = preprocess_chunk(
+                    chunk_sub,
+                    null_col_dict,
+                    index,
+                    # scale_bins=scale_bins,
+                )
                 scaled_data = scaler.transform(
-                    preprocess_chunk(chunk_sub, null_col_dict, index, scale_bins=scale_bins)
+                    preprocessed_chunk.select_dtypes(**select_dtypes_params)
                 )
                 if not scale_bins:
                     scaled_data = np.hstack(
                         (
                             scaled_data,
-                            chunk_sub.select_dtypes(include="uint8").to_numpy(),
+                            (
+                                preprocessed_chunk
+                                .select_dtypes(include="uint8")
+                                .to_numpy()
+                            ),
                         )
                     )
 
@@ -660,6 +695,15 @@ def pca(
                         dataset=True,
                         mode="append",
                         partition_cols=["sale_date"],
+                        # https://docs.aws.amazon.com/athena/latest/ug/data-types.html
+                        dtype={
+                            **{k: 'float' for k in [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]},
+                            **{
+                                'shop_id': 'smallint',
+                                'item_id': 'int',
+                                'sid_shop_item_qty_sold_day': 'smallint'
+                            }
+                        }
                     )
 
                     # also update combined shape of PCA-transformed data
@@ -687,6 +731,14 @@ def pca(
                 dataset=True,
                 mode="append",
                 partition_cols=["sale_date"],
+                dtype={
+                    **{k: 'float' for k in [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]},
+                    **{
+                        'shop_id': 'smallint',
+                        'item_id': 'int',
+                        'sid_shop_item_qty_sold_day': 'smallint'
+                    }
+                }
             )
 
             # also update combined shape of PCA-transformed data
@@ -878,6 +930,7 @@ def main():
             first_mon = (
                 "shops_"
                 + datetime.datetime.strftime(d_prev_mon, format="%y_%m")
+                + "_addl"
                 + ".csv"
             )
             logging.info(
@@ -890,6 +943,7 @@ def main():
             first_mon = (
                 "shops_"
                 + datetime.datetime.strftime(d_prev_mon, format="%y_%m")
+                + "_addl"
                 + ".csv"
             )
             logging.info(
