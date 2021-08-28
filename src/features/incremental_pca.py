@@ -249,7 +249,9 @@ def preprocess_chunk(df, null_col_dict, index):
     )
 
     # replace previously missed negative infinity value in one of the columns
-    df['id_cat_qty_sold_per_item_last_7d'] = df['id_cat_qty_sold_per_item_last_7d'].replace(-np.inf, 0)
+    df["id_cat_qty_sold_per_item_last_7d"] = df[
+        "id_cat_qty_sold_per_item_last_7d"
+    ].replace(-np.inf, 0)
 
     # cast to int the column that was for some reason cast to float in PostgreSQL
     df["id_num_unique_shops_prior_to_day"] = df[
@@ -277,37 +279,41 @@ def preprocess_chunk(df, null_col_dict, index):
     prefix = "i_item_cat_broad"
     df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
     cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
-    df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
     mons_of_first_sale = [x for x in range(13)]
     prefix = "i_item_first_mon"
     df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
-    cols = df_first_months.columns.union([prefix + "_" + str(x) for x in mons_of_first_sale])
-    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    cols = df_first_months.columns.union(
+        [prefix + "_" + str(x) for x in mons_of_first_sale]
+    )
+    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype(
+        "uint8"
+    )
 
     years = [2013, 2014, 2015]
     prefix = "d_year"
     df_years = pd.get_dummies(df.d_year, prefix=prefix)
     cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
-    df_years = df_years.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    df_years = df_years.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
     dow = [x for x in range(7)]
     prefix = "d_day_of_week"
     df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
     cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
-    df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
     months = [x for x in range(12)]
     prefix = "d_month"
     df_months = pd.get_dummies(df.d_month, prefix=prefix)
     cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
-    df_months = df_months.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    df_months = df_months.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
     quarters = [x for x in range(1, 5)]
     prefix = "d_quarter"
     df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
     cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
-    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype('uint8')
+    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype("uint8")
     # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
 
     df = pd.concat(
@@ -337,8 +343,9 @@ def preprocess_chunk(df, null_col_dict, index):
     if df[df.isin([np.inf, -np.inf])].count().any():
         cts = df[df.isin([np.inf, -np.inf])].count().to_dict()
         non_zero_cts = {k: v for k, v in cts.items() if v > 0}
-        logging.debug(f"Chunk {index} has columns with infinity values: "
-            f"{non_zero_cts}")
+        logging.debug(
+            f"Chunk {index} has columns with infinity values: " f"{non_zero_cts}"
+        )
         sys.exit(1)
 
     return df
@@ -380,7 +387,7 @@ def pca(
     with open("./features/pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
 
-    del pd_types["sale_date"] # remove sale_date as it will be included in parse_dates=
+    del pd_types["sale_date"]  # remove sale_date as it will be included in parse_dates=
 
     # change types of integer columns to floats (float32) for columns that contain nulls
     # change the dictionary values, while also extracting the key-value pairs and
@@ -388,32 +395,55 @@ def pca(
     # so columns can be changed to appropriate types after null values are filled.
     null_col_dict = dict()
     null_col_list = [
-    'sid_shop_cat_qty_sold_last_7d', 'sid_cat_sold_at_shop_before_day_flag',
-    'sid_shop_item_rolling_7d_max_qty', 'sid_shop_item_rolling_7d_min_qty',
-    'sid_shop_item_rolling_7d_avg_qty', 'sid_shop_item_rolling_7d_mode_qty',
-    'sid_shop_item_rolling_7d_median_qty', 'sid_shop_item_expand_qty_max',
-    'sid_shop_item_expand_qty_mean', 'sid_shop_item_expand_qty_min',
-    'sid_shop_item_expand_qty_mode', 'sid_shop_item_expand_qty_median',
-    'sid_shop_item_date_avg_gap_bw_sales', 'sid_shop_item_date_max_gap_bw_sales',
-    'sid_shop_item_date_min_gap_bw_sales', 'sid_shop_item_date_mode_gap_bw_sales',
-    'sid_shop_item_date_median_gap_bw_sales', 'sid_shop_item_date_std_gap_bw_sales',
-    'sid_shop_item_cnt_sale_dts_last_7d', 'sid_shop_item_cnt_sale_dts_last_30d',
-    'sid_shop_item_cnt_sale_dts_before_day', 'sid_expand_cv2_of_qty',
-    'sid_shop_item_days_since_first_sale', 'sid_days_since_max_qty_sold',
-    'sid_shop_item_qty_sold_day', 'sid_shop_item_first_month',
-    'sid_shop_item_last_qty_sold', 'sid_shop_item_first_week',
-    'sid_shop_item_expanding_adi', 'sid_shop_item_date_diff_bw_last_and_prev_qty',
-    'sid_shop_item_days_since_prev_sale', 'sid_shop_item_qty_sold_7d_ago',
-    'sid_qty_median_abs_dev', 'sid_coef_var_price', 'sid_shop_item_qty_sold_2d_ago',
-    'sid_qty_mean_abs_dev', 'sid_shop_item_qty_sold_1d_ago',
-    'sid_shop_item_qty_sold_3d_ago'
+        "sid_shop_cat_qty_sold_last_7d",
+        "sid_cat_sold_at_shop_before_day_flag",
+        "sid_shop_item_rolling_7d_max_qty",
+        "sid_shop_item_rolling_7d_min_qty",
+        "sid_shop_item_rolling_7d_avg_qty",
+        "sid_shop_item_rolling_7d_mode_qty",
+        "sid_shop_item_rolling_7d_median_qty",
+        "sid_shop_item_expand_qty_max",
+        "sid_shop_item_expand_qty_mean",
+        "sid_shop_item_expand_qty_min",
+        "sid_shop_item_expand_qty_mode",
+        "sid_shop_item_expand_qty_median",
+        "sid_shop_item_date_avg_gap_bw_sales",
+        "sid_shop_item_date_max_gap_bw_sales",
+        "sid_shop_item_date_min_gap_bw_sales",
+        "sid_shop_item_date_mode_gap_bw_sales",
+        "sid_shop_item_date_median_gap_bw_sales",
+        "sid_shop_item_date_std_gap_bw_sales",
+        "sid_shop_item_cnt_sale_dts_last_7d",
+        "sid_shop_item_cnt_sale_dts_last_30d",
+        "sid_shop_item_cnt_sale_dts_before_day",
+        "sid_expand_cv2_of_qty",
+        "sid_shop_item_days_since_first_sale",
+        "sid_days_since_max_qty_sold",
+        "sid_shop_item_qty_sold_day",
+        "sid_shop_item_first_month",
+        "sid_shop_item_last_qty_sold",
+        "sid_shop_item_first_week",
+        "sid_shop_item_expanding_adi",
+        "sid_shop_item_date_diff_bw_last_and_prev_qty",
+        "sid_shop_item_days_since_prev_sale",
+        "sid_shop_item_qty_sold_7d_ago",
+        "sid_qty_median_abs_dev",
+        "sid_coef_var_price",
+        "sid_shop_item_qty_sold_2d_ago",
+        "sid_qty_mean_abs_dev",
+        "sid_shop_item_qty_sold_1d_ago",
+        "sid_shop_item_qty_sold_3d_ago",
     ]
     for col in null_col_list:
-        if col in ['sid_cat_sold_at_shop_before_day_flag', 'sid_shop_item_first_month', 'sid_shop_item_first_week']:
-            null_col_dict[col] = 'uint8'
+        if col in [
+            "sid_cat_sold_at_shop_before_day_flag",
+            "sid_shop_item_first_month",
+            "sid_shop_item_first_week",
+        ]:
+            null_col_dict[col] = "uint8"
         else:
             null_col_dict[col] = pd_types[col]
-        pd_types[col] = 'float32'
+        pd_types[col] = "float32"
 
     # change types of binary features to 'uint8'
     # do not include the three sid_ features in bin_features here, but add them to the
@@ -435,11 +465,11 @@ def pca(
     )
     pd_types = {k: "uint8" if k in bin_features else v for k, v in pd_types.items()}
 
-    select_dtypes_params = {'include': None, 'exclude': None}
+    select_dtypes_params = {"include": None, "exclude": None}
     if scale_bins:
-        select_dtypes_params['include'] = 'number' # all numeric types
+        select_dtypes_params["include"] = "number"  # all numeric types
     else:
-        select_dtypes_params['exclude'] = 'uint8' # binary columns
+        select_dtypes_params["exclude"] = "uint8"  # binary columns
 
     # reader1, reader2, reader3 = tee(
     #     chain.from_iterable(
@@ -518,13 +548,14 @@ def pca(
                         null_col_dict,
                         index,
                         # scale_bins=scale_bins,
-                    )
-                    .select_dtypes(**select_dtypes_params)
+                    ).select_dtypes(**select_dtypes_params)
                 )
                 global_idx = index
             except ValueError:
                 unique_dict = {col: chunk[col].unique() for col in chunk.columns}
-                logging.debug(f"Unique values in chunk that produced ValueError: {unique_dict}")
+                logging.debug(
+                    f"Unique values in chunk that produced ValueError: {unique_dict}"
+                )
                 sys.exit(1)
             # they will just need to be added to scaled data for PCA
 
@@ -584,11 +615,7 @@ def pca(
                 scaled_data = np.hstack(
                     (
                         scaled_data,
-                        (
-                            preprocessed_chunk
-                            .select_dtypes(include="uint8")
-                            .to_numpy()
-                        ),
+                        (preprocessed_chunk.select_dtypes(include="uint8").to_numpy()),
                     )
                 )
             # print(
@@ -644,11 +671,15 @@ def pca(
                 chunk_sub = chunk.sample(frac=frac, random_state=42).sort_values(
                     by=["shop_id", "item_id", "sale_date"]
                 )
-                id_cols_arr = chunk_sub[["shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"]].copy()
+                id_cols_arr = chunk_sub[
+                    ["shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"]
+                ].copy()
                 # fill in null values of sid_shop_item_qty_sold_day as this data is not passed through
                 # the preprocess_chunk function
                 id_cols_arr["sid_shop_item_qty_sold_day"].fillna(0, inplace=True)
-                id_cols_arr["sid_shop_item_qty_sold_day"] = id_cols_arr["sid_shop_item_qty_sold_day"].astype('int16')
+                id_cols_arr["sid_shop_item_qty_sold_day"] = id_cols_arr[
+                    "sid_shop_item_qty_sold_day"
+                ].astype("int16")
                 id_cols_arr = id_cols_arr.to_numpy()
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
@@ -666,9 +697,9 @@ def pca(
                         (
                             scaled_data,
                             (
-                                preprocessed_chunk
-                                .select_dtypes(include="uint8")
-                                .to_numpy()
+                                preprocessed_chunk.select_dtypes(
+                                    include="uint8"
+                                ).to_numpy()
                             ),
                         )
                     )
@@ -686,9 +717,17 @@ def pca(
                     # convert the array to pandas dataframe and upload it to S3
                     # as a parquet file/dataset
                     wr.s3.to_parquet(
-                        df=pd.DataFrame(pca_transformed, columns=[
-                            "shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"] +
-                            [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]
+                        df=pd.DataFrame(
+                            pca_transformed,
+                            columns=[
+                                "shop_id",
+                                "item_id",
+                                "sale_date",
+                                "sid_shop_item_qty_sold_day",
+                            ]
+                            + [
+                                f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
+                            ],
                         ),
                         path="s3://sales-demand-data/parquet_dataset/",
                         index=False,
@@ -697,18 +736,26 @@ def pca(
                         partition_cols=["sale_date"],
                         # https://docs.aws.amazon.com/athena/latest/ug/data-types.html
                         dtype={
-                            **{k: 'float' for k in [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]},
                             **{
-                                'shop_id': 'smallint',
-                                'item_id': 'int',
-                                'sid_shop_item_qty_sold_day': 'smallint'
-                            }
-                        }
+                                k: "float"
+                                for k in [
+                                    f"pc{x}"
+                                    for x in range(1, pca_transformed.shape[1] - 3)
+                                ]
+                            },
+                            **{
+                                "shop_id": "smallint",
+                                "item_id": "int",
+                                "sid_shop_item_qty_sold_day": "smallint",
+                            },
+                        },
                     )
 
                     # also update combined shape of PCA-transformed data
-                    overall_shape = (overall_shape[0] + pca_transformed.shape[0],
-                    pca_transformed.shape[1])
+                    overall_shape = (
+                        overall_shape[0] + pca_transformed.shape[0],
+                        pca_transformed.shape[1],
+                    )
 
                     # also update total bytes consumed by PCA-transformed data
                     overall_nbytes += pca_transformed.nbytes
@@ -722,9 +769,15 @@ def pca(
             # convert the array to pandas dataframe and upload it to S3
             # as a parquet file/dataset
             wr.s3.to_parquet(
-                df=pd.DataFrame(pca_transformed, columns=[
-                    "shop_id", "item_id", "sale_date", "sid_shop_item_qty_sold_day"] +
-                    [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]
+                df=pd.DataFrame(
+                    pca_transformed,
+                    columns=[
+                        "shop_id",
+                        "item_id",
+                        "sale_date",
+                        "sid_shop_item_qty_sold_day",
+                    ]
+                    + [f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)],
                 ),
                 path="s3://sales-demand-data/parquet_dataset/",
                 index=False,
@@ -732,18 +785,25 @@ def pca(
                 mode="append",
                 partition_cols=["sale_date"],
                 dtype={
-                    **{k: 'float' for k in [f"pc{x}" for x in range(1, pca_transformed.shape[1]-3)]},
                     **{
-                        'shop_id': 'smallint',
-                        'item_id': 'int',
-                        'sid_shop_item_qty_sold_day': 'smallint'
-                    }
-                }
+                        k: "float"
+                        for k in [
+                            f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
+                        ]
+                    },
+                    **{
+                        "shop_id": "smallint",
+                        "item_id": "int",
+                        "sid_shop_item_qty_sold_day": "smallint",
+                    },
+                },
             )
 
             # also update combined shape of PCA-transformed data
-            overall_shape = (overall_shape[0] + pca_transformed.shape[0],
-            pca_transformed.shape[1])
+            overall_shape = (
+                overall_shape[0] + pca_transformed.shape[0],
+                pca_transformed.shape[1],
+            )
 
             # also update total bytes consumed by PCA-transformed data
             overall_nbytes += pca_transformed.nbytes
