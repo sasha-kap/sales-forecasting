@@ -48,6 +48,7 @@ from dask_ml.metrics.regression import mean_squared_error
 from dateutil.relativedelta import relativedelta
 from ec2_metadata import ec2_metadata
 import lightgbm as lgb
+import numpy as np
 import pandas as pd
 
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
@@ -71,6 +72,28 @@ def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
 
 def calc_rmse(y_true, y_pred):
     return mean_squared_error(y_true, y_pred, squared=False, compute=True)
+
+def calc_monthly_rmse(y_true_w_id_cols, y_pred):
+    y_true_df = y_true_w_id_cols.compute() # convert Dask dataframe to Pandas DF
+    y_pred_df = pd.DataFrame(y_pred.compute(), columns=['y_pred'], index=y_true_df.index) # convert Dask array to Pandas DF
+    full_df = pd.concat([y_true_df, y_pred_df], axis=1) # join actual and predicted values
+    del y_true_df
+    del y_pred_df
+    # calculate sums of actual and predicted values by shop-item-month
+    # the code below assumes that same calendar month does not appear across multiple years in validation set
+    shop_item_month_df = full_df.groupby([full_df.index.month, 'shop_id', 'item_id']).agg('sum').reset_index()
+    logging.debug(f"Columns in shop_item_month_df are: {shop_item_month_df.columns.to_list()}")
+    # calculate RMSE for each month and then take the average of monthly values
+    return (
+        shop_item_month_df
+        .groupby('sale_date')
+        .apply(
+            lambda x: np.sqrt(np.average((x['sid_shop_item_qty_sold_day'] - x['y_pred'])**2))
+        )
+        .mean()
+    )
+    # calculate monthly rmse
+    # return np.sqrt(np.average((shop_item_df['sid_shop_item_qty_sold_day'] - shop_item_df['y_pred'])**2))
 
 def valid_frac(s):
     """Convert command-line fraction argument to float value.
@@ -265,7 +288,8 @@ class LightGBMDaskLocal:
     loop over train-valdation sets
     run model's fit method and compute predicted values and RMSE
     """
-    def __init__(self, n_workers, s3_path, startmonth, n_months_in_first_train_set, n_months_in_val_set, frac=None):
+    def __init__(self, curr_dt_time, n_workers, s3_path, startmonth, n_months_in_first_train_set, n_months_in_val_set, frac=None):
+        self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
         self.n_months_in_first_train_set = n_months_in_first_train_set
         self.n_months_in_val_set = n_months_in_val_set
@@ -380,6 +404,7 @@ class LightGBMDaskLocal:
             # self.params_combs_list.append(params_comb_dict)
             self.params_comb_dict = params_comb_dict
             self.params_comb_dict['rmse_list_'] = list()
+            self.params_comb_dict['monthly_rmse_list_'] = list()
             self.params_comb_dict['fit_times_list_'] = list()
             try:
                 self.model = lgb.DaskLGBMRegressor(client=self.client, random_state=42, silent=False, tree_learner='data', force_row_wise=True, **params_comb_dict)
@@ -390,15 +415,16 @@ class LightGBMDaskLocal:
                 sys.exit(1)
 
             # call method that loops over train-validation sets
-            with performance_report(filename="dask-report.html"):
+            with performance_report(filename=f"dask_report_{self.curr_dt_time}.html"):
                 for train, test in self.train_test_time_split():
                     self.fit(train).predict(test).rmse_all_folds(test)
 
             self.params_comb_dict['avg_rmse_'] = mean(self.params_comb_dict['rmse_list_'])
+            self.params_comb_dict['monthly_avg_rmse_'] = mean(self.params_comb_dict['monthly_rmse_list_'])
             self.all_params_combs.append(self.params_comb_dict)
 
-        best_params = max(self.all_params_combs, key=lambda x: x['avg_rmse_'])
-        self.best_score_ = best_params['avg_rmse_']
+        best_params = max(self.all_params_combs, key=lambda x: x['monthly_avg_rmse_'])
+        self.best_score_ = best_params['monthly_avg_rmse_']
         # remove non-parameter key-values from self.best_params (i.e., rmse_list_ and avg_rmse_, etc.)
         self.best_params_ = {k: v for k, v in best_params.items() if k in params}
 
@@ -409,7 +435,7 @@ class LightGBMDaskLocal:
             all_params_combs_df.to_csv(output_csv, index=False)
 
             try:
-                key = f"lightgbm_all_params_combs_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.csv"
+                key = f"lightgbm_all_params_combs_{self.curr_dt_time}.csv"
                 # global s3_client
                 s3_client = boto3.client("s3")
                 response = s3_client.upload_file(output_csv, "sales-demand-data", key)
@@ -498,6 +524,9 @@ class LightGBMDaskLocal:
             # logging.debug(f"Shape of self.y_pred is: {self.y_pred.compute().shape}")
             self.params_comb_dict['rmse_list_'].append(calc_rmse(test["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True), self.y_pred.compute_chunk_sizes()))
             # self.rmse_results[json.dumps(self.hyper_dict)].append(calc_rmse(test[["sid_shop_item_qty_sold_day"]], self.y_pred))
+
+            self.params_comb_dict['monthly_rmse_list_'].append(calc_monthly_rmse(test[['shop_id', 'item_id', 'sid_shop_item_qty_sold_day']], self.y_pred))
+
         except Exception:
             logging.exception("Exception occurred while computing RMSE on the test data.")
             # kill all active work, delete all data on the network, and restart the worker processes.
@@ -594,11 +623,12 @@ def main():
     log_dir = Path.cwd().joinpath("logs")
     path = Path(log_dir)
     path.mkdir(exist_ok=True)
-    log_fname = f"logging_{datetime.now().strftime('%Y_%m_%d_%H_%M')}_lightgbm.log"
+    curr_dt_time = datetime.now().strftime('%Y_%m_%d_%H_%M')
+    log_fname = f"logging_{curr_dt_time}_lightgbm.log"
     log_path = log_dir.joinpath(log_fname)
 
     model_dir = Path.cwd()
-    model_fname = f"lgbr_model_{datetime.now().strftime('%Y_%m_%d_%H_%M')}.txt"
+    model_fname = f"lgbr_model_{curr_dt_time}.txt"
     model_path = model_dir.joinpath(model_fname)
 
     logging.basicConfig(
@@ -656,7 +686,7 @@ def main():
     )
 
     model = LightGBMDaskLocal(
-        args.n_workers, args.s3_path, args.startmonth, args.n_months_in_first_train_set, args.n_months_in_val_set, frac=args.frac
+        curr_dt_time, args.n_workers, args.s3_path, args.startmonth, args.n_months_in_first_train_set, args.n_months_in_val_set, frac=args.frac
     )
     model.gridsearch_wfv(params)
     model.refit_and_save(model_path)
