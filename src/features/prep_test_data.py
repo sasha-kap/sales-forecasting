@@ -197,6 +197,7 @@ from queries import lag_query, all_queries_str
 # thread_function completes the SQL commands
 # run function calls thread_function with individual parts of the list of SQL queries
 
+
 class MultiThreadDBClass(threading.Thread):
     def __init__(self, group=None, target=None, name=None, args=(), kwargs=None):
         """Create database connection for each thread separately.
@@ -244,7 +245,8 @@ class MultiThreadDBClass(threading.Thread):
                 :
             ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
-                cur.execute(sql, self.kwargs)
+                for q in sql.split("; "):
+                    cur.execute(q, self.kwargs)
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as e:
@@ -427,6 +429,7 @@ class SingleThreadDBClass:
                 sql = (
                     "DELETE FROM sales_cleaned WHERE sale_date >= make_date(2015,11,1)"
                 )
+                logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -466,7 +469,10 @@ class SingleThreadDBClass:
                     "DELETE FROM shop_item_dates "
                     "WHERE sale_date >= make_date(2015,11,1);"
                 )
-                cur.execute(sql)
+                for q in sql.split("; "):
+                    logging.debug(f"SQL query to be executed: {q}")
+                    cur.execute(q)
+
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -541,6 +547,7 @@ class SingleThreadDBClass:
                     "aws_commons.create_s3_uri('my-rds-exports', 'test_data_for_scoring.csv', 'us-west-2'),"
                     "options :='format csv, header');"
                 )
+                logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred in export_features function.")
@@ -609,7 +616,10 @@ class SingleThreadDBClass:
                     # SOME OF THE SID_ FEATURES NEED TO BE INSERTED INTO OTHER SID_ TABLES -
                     # for now, decided not to insert anything into those other sid_ tables
                 )
-                cur.execute(sql)
+                for q in sql.split("; "):
+                    logging.debug(f"SQL query to be executed: {q}")
+                    cur.execute(q)
+
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -629,7 +639,7 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def import_preds_into_new_table(self, first_day):
+    def import_preds_into_new_table(self, first_day, day_counter):
         """ Import predictions from first model into daily_sid_predictions table
         in PostgreSQL database.
 
@@ -638,6 +648,8 @@ class SingleThreadDBClass:
         first_day : bool
             Indicator for currently generating and storing predictions for the
             first day in the test period
+        day_counter : int
+            Day counter starting from 1 for Nov 1
         """
         try:
             if first_day:
@@ -650,7 +662,10 @@ class SingleThreadDBClass:
                         "CREATE TABLE daily_sid_predictions (shop_id smallint NOT NULL, "
                         "item_id int NOT NULL, sale_date date NOT NULL, model1 int NOT NULL)"
                     )
-                    cur.execute(sql)
+                    for q in sql.split("; "):
+                        logging.debug(f"SQL query to be executed: {q}")
+                        cur.execute(q)
+
                 for line in self.conn.notices:
                     logging.debug(line.strip("\n"))
 
@@ -662,10 +677,11 @@ class SingleThreadDBClass:
             with self.conn.cursor() as cur:
                 sql = (
                     f"SELECT aws_s3.table_import_from_s3('daily_sid_predictions', '', '(format csv, header)', "
-                    f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_model1.csv', 'us-west-2'))"
+                    f"aws_commons.create_s3_uri('sales-demand-data', 'preds_model1_{day_counter}.csv', 'us-west-2'))"
                     # if going to have separate CSVs for each day's predictions, need to update the preds_model1.csv parameter above to include date
                     # same for csv path below (in the import_preds_into_existing_table function)
                 )
+                logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -688,7 +704,7 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def import_preds_into_existing_table(self, first_day, model_col):
+    def import_preds_into_existing_table(self, first_day, day_counter, model_col):
         """ Import predictions from any model after the first model into
         daily_sid_predictions table in PostgreSQL database.
 
@@ -697,6 +713,8 @@ class SingleThreadDBClass:
         first_day : bool
             Indicator for currently generating and storing predictions for the
             first day in the test period
+        day_counter : int
+            Day counter starting from 1 for Nov 1
         model_col : str
             Name of column in daily predictions table containing predictions
             for current model
@@ -713,6 +731,7 @@ class SingleThreadDBClass:
                         "ADD COLUMN {0} smallint NOT NULL;"
                     )
                     sql = SQL(sql_str).format(Identifier(model_col))
+                    logging.debug(f"Query to be executed: {sql_str}")
                     cur.execute(sql)
                 for line in self.conn.notices:
                     logging.debug(line.strip("\n"))
@@ -722,21 +741,34 @@ class SingleThreadDBClass:
                 :
             ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
+                # temp tables will be one per day, and they will be dropped
+                # after one model's code is done (i.e., at conclusion of run)
+                temp_table_name = f"new_model_preds_{day_counter}"
                 sql_str = (
-                    "CREATE TEMP TABLE new_model_preds (shop_id smallint NOT NULL, "
-                    "item_id int NOT NULL, sale_date date NOT NULL, {0} smallint NOT NULL); "
-                    "SELECT aws_s3.table_import_from_s3('new_model_preds', '', '(format csv, header)', "
-                    f"aws_commons.create_s3_uri('sales-demand-predictions', 'preds_{model_col}.csv', 'us-west-2')); "
+                    "CREATE TEMP TABLE {0} (shop_id smallint NOT NULL, "
+                    "item_id int NOT NULL, sale_date date NOT NULL, {1} smallint NOT NULL);"
+                )
+                sql1 = SQL(sql_str).format(
+                    Identifier(temp_table_name), Identifier(model_col),
+                )
+                sql2 = (
+                    f"SELECT aws_s3.table_import_from_s3({temp_table_name}, '', '(format csv, header)', "
+                    f"aws_commons.create_s3_uri('sales-demand-data', 'preds_{model_col}_{day_counter}.csv', 'us-west-2'));"
+                )
+                sql_str = (
                     "UPDATE daily_sid_predictions dsp "
                     "SET {0} = {1} "
                     "FROM new_model_preds nmp "
                     "WHERE dsp.shop_id = nmp.shop_id AND dsp.item_id = nmp.item_id AND "
                     "dsp.sale_date = nmp.sale_date;"
                 )
-                sql = SQL(sql_str).format(
+                sql3 = SQL(sql_str).format(
                     Identifier(model_col), Identifier("nmp", model_col),
                 )
-                cur.execute(sql)
+                for q in (sql1, sql2, sql3):
+                    logging.debug(f"SQL query to be executed: {q}")
+                    cur.execute(q)
+
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -758,7 +790,7 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def check_size_of_preds_table(self, model_cnt):
+    def check_size_of_preds_table(self, model_cnt, day_counter):
         """ Query size of daily_sid_predictions to make sure it has the right
         number of columns and rows after being populated with another day of data.
 
@@ -766,6 +798,8 @@ class SingleThreadDBClass:
         -----------
         model_cnt : int
             Model number (number of the model currently being worked on)
+        day_counter : int
+            Day counter starting from 1 for Nov 1
         """
         row_and_col_cts_can_be_used = True
         del self.conn.notices[:]  # clear the notices list before executing next query
@@ -780,6 +814,7 @@ class SingleThreadDBClass:
                 "FROM cols"
             )
             try:
+                logging.debug(f"Query to be executed: {sql}")
                 n_cols = cur.execute(sql).fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
@@ -791,6 +826,7 @@ class SingleThreadDBClass:
         with self.conn.cursor() as cur:
             sql = "SELECT count(*) FROM daily_sid_predictions AS n_rows"
             try:
+                logging.debug(f"Query to be executed: {sql}")
                 n_rows = cur.execute(sql).fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
@@ -804,9 +840,9 @@ class SingleThreadDBClass:
         if row_and_col_cts_can_be_used:
             # there should be 214,200 rows per day
             # there should be 3 (shop, item, date) + 2 * model columns
-            if (n_rows != 214_200 * i) or (n_cols != (3 + 1 * model_cnt)):
+            if (n_rows != 214_200 * day_counter) or (n_cols != (3 + 1 * model_cnt)):
                 logging.error(
-                    f"Expected {214_200 * i} rows and {3 + 1 * model_cnt} "
+                    f"Expected {214_200 * day_counter} rows and {3 + 1 * model_cnt} "
                     "columns at this point in the predictions table; "
                     f"instead, the table has {n_rows} rows and {n_cols} columns."
                 )
@@ -845,6 +881,7 @@ class SingleThreadDBClass:
                     "WHERE d.sale_date = dt.sale_date; "
                 )
                 sql = SQL(sql_str).format(Identifier(model_col))
+                logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
             with self.conn.cursor() as cur:
                 sql_str = (
@@ -859,6 +896,7 @@ class SingleThreadDBClass:
                     "WHERE id.sale_date = %(curr_date)s AND id.item_id = it.item_id; "
                 )
                 sql = SQL(sql_str).format(Identifier(model_col))
+                logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
             with self.conn.cursor() as cur:
                 sql_str = (
@@ -873,6 +911,7 @@ class SingleThreadDBClass:
                     "WHERE sd.sale_date = %(curr_date)s AND sd.shop_id = st.shop_id; "
                 )
                 sql = SQL(sql_str).format(Identifier(model_col))
+                logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
             with self.conn.cursor() as cur:
                 sql_str = (
@@ -883,6 +922,7 @@ class SingleThreadDBClass:
                     "sid.item_id = dsp.item_id; "
                 )
                 sql = SQL(sql_str).format(Identifier("dsp", model_col))
+                logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
             with self.conn.cursor() as cur:
                 # insert non-zero sid predicted quantity into sales_cleaned
@@ -893,6 +933,7 @@ class SingleThreadDBClass:
                     "WHERE {0} <> 0 AND sale_date = %(curr_date)s"
                 )
                 sql = SQL(sql_str).format(Identifier(model_col))
+                logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -1009,7 +1050,11 @@ def main():
     # start RDS instance
     start_instance()
 
-    logging.info(f"Starting to run predictions for model {args.modelnum}...")
+    logging.info(
+        f"Starting to run predictions for model {args.modelnum}, "
+        f"with {datetime.datetime.strftime(args.firstday, format='%Y-%m-%d')} "
+        f"as first day, and {args.numdays} days for which to run predictions..."
+    )
 
     # create database connection
     db = SingleThreadDBClass(is_aws, log_fname)
@@ -1022,6 +1067,7 @@ def main():
         logging.info(f"Starting to run predictions for {curr_date_str}...")
 
         first_day = curr_date == datetime.date(2015, 11, 1)
+        day_counter = curr_dt.day
         first_model = args.modelnum == 1
         params = {"curr_date": curr_date}
 
@@ -1080,6 +1126,7 @@ def main():
 
             # copy log file to S3 bucket if running script on a EC2 instance
             if is_aws:
+                s3_client = boto3.client("s3")
                 try:
                     response = s3_client.upload_file(
                         f"./logs/{log_fname}", "my-ec2-logs", log_fname
@@ -1127,11 +1174,13 @@ def main():
         #   except for sales_cleaned -> need to delete rows from previous model (for all days: 11/1 thru 11/30) and insert rows anew
         #       so this deletion only needs to happen once at the beginning of running predictions for that model
         if first_model:
-            db.import_preds_into_new_table(first_day)
+            db.import_preds_into_new_table(first_day, day_counter)
         else:
-            db.import_preds_into_existing_table(first_day, f"model{args.modelnum}")
+            db.import_preds_into_existing_table(
+                first_day, day_counter, f"model{args.modelnum}"
+            )
 
-        db.check_size_of_preds_table(args.modelnum)
+        db.check_size_of_preds_table(args.modelnum, day_counter)
 
         db.agg_preds(f"model{args.modelnum}", params)
 
@@ -1239,22 +1288,22 @@ if __name__ == "__main__":
 
 
 #  'id_item_days_since_first_sale': 'int32',
-query = (
-    "SELECT item_id, make_date(___) - first_sale_dt AS id_item_days_since_first_sale "
-    "FROM ("
-    "SELECT item_id, min(sale_date) AS first_sale_dt "
-    "FROM item_dates "
-    "GROUP BY item_id) t1"
-)
-#  'id_item_days_since_prev_sale': 'int16',
-query = (
-    "SELECT item_id, make_date(___) - last_sale_dt AS id_item_days_since_prev_sale "
-    "FROM ("
-    "SELECT item_id, max(sale_date) AS last_sale_dt "
-    "FROM item_dates "
-    "WHERE id_item_qty_sold_day > 0 "
-    "GROUP BY item_id) t1"
-)
+# query = (
+#     "SELECT item_id, make_date(___) - first_sale_dt AS id_item_days_since_first_sale "
+#     "FROM ("
+#     "SELECT item_id, min(sale_date) AS first_sale_dt "
+#     "FROM item_dates "
+#     "GROUP BY item_id) t1"
+# )
+# #  'id_item_days_since_prev_sale': 'int16',
+# query = (
+#     "SELECT item_id, make_date(___) - last_sale_dt AS id_item_days_since_prev_sale "
+#     "FROM ("
+#     "SELECT item_id, max(sale_date) AS last_sale_dt "
+#     "FROM item_dates "
+#     "WHERE id_item_qty_sold_day > 0 "
+#     "GROUP BY item_id) t1"
+# )
 # ALSO NEED TO CHECK MAX/MIN(SALE_DATE) NEEDS TO BE CAST TO DATE (::date) AND THE SUBTRACTION OPERATION TO INTEGER
 
 
