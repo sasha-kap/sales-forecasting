@@ -492,8 +492,15 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def export_features(self):
-        """ Export features from PostgreSQL to CSV file. """
+    def export_features(self, csv_path):
+        """ Export features from PostgreSQL to CSV file.
+
+        Parameters:
+        -----------
+        csv_path : str or pathlib.Path() object
+            Filepath (directory and filename) of CSV file containing list of
+            columns to export from PostgreSQL as test data
+        """
         try:
             # join sid_new_day with id_new_day on item,
             # with sd_new_day on shop,
@@ -510,7 +517,7 @@ class SingleThreadDBClass:
             }
 
             sql_col_list = []
-            with open(f"./{col_names_csv_path}", "r") as col_file:
+            with open(f"./{csv_path}", "r") as col_file:
                 csv_reader = csv.reader(col_file, delimiter=",")
                 next(csv_reader, None)  # skip header row
                 for row in csv_reader:
@@ -566,9 +573,15 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def append_features(self):
+    def append_features(self, csv_path):
         """ Append individual features to the appropriate existing tables
         (e.g., id_... features are appended to the item_dates table).
+
+        Parameters:
+        -----------
+        csv_path : str or pathlib.Path() object
+            Filepath (directory and filename) of CSV file containing list of
+            columns and tables that those columns belong to
         """
         try:
             # insert into items_ver(item_id, item_group, name)
@@ -579,7 +592,7 @@ class SingleThreadDBClass:
             sd_col_list = []
             sid_new_col_list = []
             sid_main_col_list = []
-            with open(f"./{col_names_csv_path}", "r") as col_file:
+            with open(f"./{csv_path}", "r") as col_file:
                 csv_reader = csv.reader(col_file, delimiter=",")
                 next(csv_reader, None)  # skip header row
                 for row in csv_reader:
@@ -1150,9 +1163,9 @@ def main():
         if not Path(col_names_csv_path).is_file():
             db.query_col_names(col_names_csv_path, cols_csv_fname)
 
-        db.export_features()
+        db.export_features(col_names_csv_path)
 
-        db.append_features()
+        db.append_features(col_names_csv_path)
 
         # HERE IS WHERE PREDICTIONS ARE GENERATED
 
