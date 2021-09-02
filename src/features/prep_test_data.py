@@ -173,9 +173,11 @@ ADD CONN.NOTICES OUTPUT TO QUERIES
 import argparse
 import csv
 import datetime
+import json
 import logging
 import os
 from pathlib import Path
+import pickle as pk
 import platform
 import sys
 import threading
@@ -183,11 +185,17 @@ import threading
 import boto3
 from botocore.exceptions import ClientError
 from ec2_metadata import ec2_metadata
+import lightgbm as lgb
+import numpy as np
+import pandas as pd
 import psycopg2
 from psycopg2.sql import SQL, Identifier
+from sklearn.decomposition import IncrementalPCA
+from sklearn.preprocessing import StandardScaler
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
 
+from incremental_pca import preprocess_chunk
 from utils.config import config
 from utils.rds_instance_mgmt import start_instance, stop_instance
 from utils.timer import Timer
@@ -993,6 +1001,23 @@ def main():
         choices=range(1, 30),
     )
     parser.add_argument(
+        "pkl_dt_time",
+        metavar="<pkl_dt_time>",
+        help="date-time embedded in filenames of scaler and PCA files on S3",
+    )
+    parser.add_argument(
+        "lgb_dt_time",
+        metavar="<lgb_dt_time>",
+        help="date-time embedded in filename of LGBRegressor model saved on S3",
+    )
+    parser.add_argument(
+        "--scale_bins",
+        "-b",
+        default=False,
+        action="store_true",
+        help="scale binary features (if included) or not (if not included)",
+    )
+    parser.add_argument(
         "--stop",
         default=False,
         action="store_true",
@@ -1066,11 +1091,63 @@ def main():
     logging.info(
         f"Starting to run predictions for model {args.modelnum}, "
         f"with {datetime.datetime.strftime(args.firstday, format='%Y-%m-%d')} "
-        f"as first day, and {args.numdays} days for which to run predictions..."
+        f"as first day, {args.numdays} days for which to run predictions, "
+        f"{args.pkl_dt_time} date-time for pickle files, {args.lgb_dt_time} "
+        f"date-time for LGBRegressor model file, and {args.scale_bins} value "
+        "for scale_bins parameter..."
     )
 
     # create database connection
     db = SingleThreadDBClass(is_aws, log_fname)
+
+    # objects needed for prediction step
+    # load mapping of PostgreSQL types that exist in sales database to Pandas data types
+    with open("pd_types_from_psql_mapping.json", "r") as f:
+        pd_types = json.load(f)
+    del pd_types["sale_date"]  # remove sale_date as it will be included in parse_dates=
+    # change types of binary features to 'uint8'
+    bin_features = (
+        "d_holiday",
+        "d_is_weekend",
+        "d_major_event",
+        "d_ps4_game_release_dt",
+        "d_ps4_game_release_dt_plus_2",
+        "i_digital_item",
+        "id_item_first_month",
+        "id_item_first_week",
+        "id_item_had_spike_before_day",
+        "s_online_store",
+        "sd_shop_first_month",
+        "sd_shop_first_week",
+        "sid_cat_sold_at_shop_before_day_flag",
+        "sid_shop_item_first_month",
+        "sid_shop_item_first_week",
+    )
+    pd_types = {k: "uint8" if k in bin_features else v for k, v in pd_types.items()}
+    # DOWNLOAD MODEL, PCA AND SCALER FILES FROM S3 TO EC2 INSTANCE
+    # s3_client.download_file('BUCKET_NAME', 'OBJECT_NAME', 'FILE_NAME')
+    s3_client.download_file(
+        "sales-demand-data", f"scaler_{args.pkl_dt_time}.pkl", "scaler.pkl"
+    )
+    s3_client.download_file(
+        "sales-demand-data", f"pca_{args.pkl_dt_time}.pkl", "pca.pkl"
+    )
+    s3_client.download_file(
+        "sales-demand-data", f"lgbr_model_{args.lgb_dt_time}.txt", "lgbr_model.txt"
+    )
+    # load scaler and PCA objects from pickle files
+    with open("scaler.pkl", "rb") as fp:
+        scaler = pk.load(fp)
+    with open("pca.pkl", "rb") as fp:
+        sklearn_pca = pk.load(fp)
+    # scale features
+    select_dtypes_params = {"include": None, "exclude": None}
+    if args.scale_bins:
+        select_dtypes_params["include"] = "number"  # all numeric types
+    else:
+        select_dtypes_params["exclude"] = "uint8"  # binary columns
+    # load saved LightGBM model from file
+    model = lgb.Booster(model_file="lgbr_model.txt")
 
     for curr_date in [
         args.firstday + datetime.timedelta(days=x) for x in range(args.numdays)
@@ -1168,6 +1245,55 @@ def main():
         db.append_features(col_names_csv_path)
 
         # HERE IS WHERE PREDICTIONS ARE GENERATED
+        # load CSV of features into a pandas dataframe
+        s3_client = boto3.client("s3")
+        csv_body = s3_client.get_object(
+            Bucket="my-rds-exports", Key="test_data_for_scoring.csv"
+        ).get("Body")
+        df = pd.read_csv(csv_body, dtype=pd_types, parse_dates=["sale_date"])
+        # extract shop_id, item_id and sale_date cols from df and put them into numpy array
+        id_cols_arr = df[["shop_id", "item_id", "sale_date"]].to_numpy()
+        # call function to preprocess features
+        df = preprocess_chunk(df, {}, day_counter)
+        # scale the data
+        scaled_data = scaler.transform(df.select_dtypes(**select_dtypes_params))
+        # PCA-transform features
+        if not args.scale_bins:
+            scaled_data = np.hstack(
+                (scaled_data, (df.select_dtypes(include="uint8").to_numpy()),)
+            )
+        pca_transformed_data = sklearn_pca.transform(scaled_data)
+        # call predict on PCA-transformed data and save predictions to file on S3
+        # https://lightgbm.readthedocs.io/en/latest/pythonapi/lightgbm.Booster.html#lightgbm.Booster.predict
+        # DO I NEED TO SPECIFY WHICH PC COLUMN IS WHICH - I.E. WHAT FORMAT SHOULD
+        # THE DATA BE PROVIDED TO LIGHTGBM?
+        # e.g., preds_model1_{day_counter}.csv
+        pred_arr = model.predict(pca_transformed_data)
+        full_pred_df = pd.DataFrame(
+            np.hstack((id_cols_arr, pred_arr)),
+            columns=["shop_id", "item_id", "sale_date", f"model{args.modelnum}"],
+        )
+        output_csv = f"preds_model{args.modelnum}_{day_counter}.csv"
+        full_pred_df.to_csv(output_csv, index=False)
+        try:
+            s3_client.upload_file(output_csv, "sales-demand-data", output_csv)
+            logging.info(
+                f"CSV file with predictions for model {args.modelnum} and day "
+                f"{day_counter} successfully copied to S3."
+            )
+        except ClientError as e:
+            logging.exception(
+                f"CSV file with predictions for model {args.modelnum} and day "
+                f"{day_counter} was not copied to S3."
+            )
+        # two things to account for:
+        # 1) binary feature scaling option and concatenating unscaled binary features with scaled data
+        # 2) id columns - extract shop_id, item_id and sale_date cols from
+        # df before running the data through scaler and PCA, then convert it to
+        # numpy array and hstack it with prediction column
+        # ALSO, I MAY NEED TO INTEGRATE THE ID COLUMN FROM TEST_DATA TABLE -
+        # can just merge the shop-item predictions with test.csv on shop-item to
+        # get id column
 
         # get shop-item-date predicted values back into PostgreSQL and update quantity sold values
         # in dates (d_day_total_qty_sold), item_dates (id_item_qty_sold_day),
