@@ -42,6 +42,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import pickle as pk
 import platform
 import sys
 import time
@@ -124,7 +125,7 @@ def list_csvs(bucket="my-rds-exports", prefix="shops", first_mon=""):
 # shows how to dump PCA object to pickle file
 
 
-def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
+def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
     """Plot cumulative explained variance of all PCs from PCA results.
 
     Parameters:
@@ -137,6 +138,9 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
         Fraction of rows that was sampled from CSVs
     scale_bins : bool
         Whether binary columns were scaled with StandardScaler prior to PCA
+    curr_dt_time : str
+        Date-time string created at start of script and to be used to insert
+        consistent timestamp in filenames
 
     Returns:
     --------
@@ -185,7 +189,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins):
     ax.grid(True)
     plt.savefig("pca_components.png")
     try:
-        key = f"pca_components_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')}.png"
+        key = f"pca_components_{curr_dt_time}.png"
         response = s3_client.upload_file("pca_components.png", "sales-demand-data", key)
     except ClientError as e:
         logging.exception("PCA explained variance plot file was not copied to S3.")
@@ -229,7 +233,9 @@ def preprocess_chunk(df, null_col_dict, index):
         + ["d_day_total_qty_sold"]
         + ["shop_id", "item_id", "sale_date"]
     )
-    df.drop(cols_to_drop, axis=1, inplace=True)
+    # errors='ignore' is added to suppress error when sid_coef_var_price is not found
+    # among existing labels
+    df.drop(cols_to_drop, axis=1, inplace=True, errors='ignore')
 
     # fill columns with null values and change data type from float to the type
     # previously determined for each column
@@ -358,6 +364,7 @@ def pca(
     first_mon="",
     frac=1.0,
     scale_bins=False,
+    curr_dt_time="",
 ):
     """Implement StandardScaler and IncrementalPCA with partial_fit() methods.
 
@@ -376,6 +383,9 @@ def pca(
     scale_bins : bool
         Whether binary columns are to be scaled with StandardScaler prior to PCA
         (default: False)
+    curr_dt_time : str
+        Date-time string created at start of script and to be used to insert
+        consistent timestamp in filenames
 
     Returns:
     --------
@@ -384,7 +394,7 @@ def pca(
     csv_list = list_csvs(first_mon=first_mon)
     assert isinstance(csv_list, list), f"csv_list is not a list, but {type(csv_list)}!"
 
-    with open("./features/pd_types_from_psql_mapping.json", "r") as f:
+    with open("pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
 
     del pd_types["sale_date"]  # remove sale_date as it will be included in parse_dates=
@@ -435,6 +445,8 @@ def pca(
         "sid_shop_item_qty_sold_3d_ago",
     ]
     for col in null_col_list:
+        # these 3 columns have nulls, but they will need to be set to uint8
+        # after nulls are filled, not to their signed data type
         if col in [
             "sid_cat_sold_at_shop_before_day_flag",
             "sid_shop_item_first_month",
@@ -510,10 +522,10 @@ def pca(
                 logging.debug(
                     f"Columns in DF converted from CSV: {list(enumerate(chunk.columns))}"
                 )
-            if chunk.isna().any().any():
-                logging.debug(
-                    f"Chunk {index} has {', '.join(chunk.columns[chunk.isna().any()])} columns with nulls"
-                )
+            # if chunk.isna().any().any():
+            #     logging.debug(
+            #         f"Chunk {index} has {', '.join(chunk.columns[chunk.isna().any()])} columns with nulls"
+            #     )
             if index % 25 == 0:
                 print(
                     f"current index is {index} and current time is "
@@ -636,7 +648,7 @@ def pca(
             f"The estimated number of principal components: {sklearn_pca.n_components_}"
         )
         logging.info(f"The total number of samples seen: {sklearn_pca.n_samples_seen_}")
-        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins)
+        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins, curr_dt_time)
 
     else:
         print("Starting third iteration over CSVs - IncrementalPCA transform...")
@@ -824,6 +836,25 @@ def pca(
                 "match the combined shape of individual chunks!!!"
             )
 
+        print("Saving StandardScaler object and IncrementalPCA object to files...")
+        # save the scaler
+        with open('scaler.pkl', 'wb') as fp:
+            pk.dump(scaler, fp)
+        # save the PCA object
+        with open('pca.pkl', 'wb') as fp:
+            pk.dump(sklearn_pca, fp)
+
+        try:
+            key = f"scaler_{curr_dt_time}.pkl"
+            response = s3_client.upload_file("scaler.pkl", "sales-demand-data", key)
+        except ClientError as e:
+            logging.exception("Pickle file with dump of StandardScaler object was not copied to S3.")
+        try:
+            key = f"pca_{curr_dt_time}.pkl"
+            response = s3_client.upload_file("pca.pkl", "sales-demand-data", key)
+        except ClientError as e:
+            logging.exception("Pickle file with dump of PCA object was not copied to S3.")
+
             # save transformed data array to npy file on S3
             # IS IT OKAY TO BUILD UP A LARGE COMPLETE PCA_TRANSFORMED ARRAY?
             # SAY 20 PCs AND 10 MLN ROWS > 200 MLN * 8 BYTES = 1.6GB
@@ -939,7 +970,8 @@ def main():
         log_dir = Path.cwd().joinpath("logs")
         path = Path(log_dir)
         path.mkdir(exist_ok=True)
-        log_fname = f"logging_{datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')}_{args.command}.log"
+        curr_dt_time = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')
+        log_fname = f"logging_{curr_dt_time}_{args.command}.log"
         log_path = log_dir.joinpath(log_fname)
 
         logging.basicConfig(
@@ -1016,6 +1048,7 @@ def main():
                 first_mon=first_mon,
                 frac=args.frac,
                 scale_bins=args.scale_bins,
+                curr_dt_time=curr_dt_time,
             )
 
         # copy log file to S3 bucket
