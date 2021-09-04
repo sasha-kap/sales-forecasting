@@ -14,19 +14,19 @@
 # "s3://sales-demand-data/parquet_dataset/"
 
 # save_model(filename, num_iteration=None, start_iteration=0, importance_type='split')[source]
-    # Save Booster to file.
-    #
-    # Parameters
-    # filename (string or pathlib.Path) – Filename to save Booster.
-    # num_iteration (int or None, optional (default=None)) – Index of the iteration that should be saved. If None, if the best iteration exists, it is saved; otherwise, all iterations are saved. If <= 0, all iterations are saved.
-    # start_iteration (int, optional (default=0)) – Start index of the iteration that should be saved.
-    # importance_type (string, optional (default="split")) – What type of feature importance should be saved. If “split”, result contains numbers of times the feature is used in a model. If “gain”, result contains total gains of splits which use the feature.
-    #
-    # Returns
-    # self – Returns self.
-    #
-    # Return type
-    # Booster
+# Save Booster to file.
+#
+# Parameters
+# filename (string or pathlib.Path) – Filename to save Booster.
+# num_iteration (int or None, optional (default=None)) – Index of the iteration that should be saved. If None, if the best iteration exists, it is saved; otherwise, all iterations are saved. If <= 0, all iterations are saved.
+# start_iteration (int, optional (default=0)) – Start index of the iteration that should be saved.
+# importance_type (string, optional (default="split")) – What type of feature importance should be saved. If “split”, result contains numbers of times the feature is used in a model. If “gain”, result contains total gains of splits which use the feature.
+#
+# Returns
+# self – Returns self.
+#
+# Return type
+# Booster
 
 import argparse
 from datetime import datetime, timedelta
@@ -51,6 +51,7 @@ import lightgbm as lgb
 import numpy as np
 import pandas as pd
 
+
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
     """Calculate number of months (i.e. month boundaries) between the first
     month of train period and the end month of validation period.
@@ -70,30 +71,41 @@ def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
         - fm.month
     )
 
+
 def calc_rmse(y_true, y_pred):
     return mean_squared_error(y_true, y_pred, squared=False, compute=True)
 
+
 def calc_monthly_rmse(y_true_w_id_cols, y_pred):
-    y_true_df = y_true_w_id_cols.compute() # convert Dask dataframe to Pandas DF
-    y_pred_df = pd.DataFrame(y_pred.compute(), columns=['y_pred'], index=y_true_df.index) # convert Dask array to Pandas DF
-    full_df = pd.concat([y_true_df, y_pred_df], axis=1) # join actual and predicted values
+    y_true_df = y_true_w_id_cols.compute()  # convert Dask dataframe to Pandas DF
+    y_pred_df = pd.DataFrame(
+        y_pred.compute(), columns=["y_pred"], index=y_true_df.index
+    )  # convert Dask array to Pandas DF
+    full_df = pd.concat(
+        [y_true_df, y_pred_df], axis=1
+    )  # join actual and predicted values
     del y_true_df
     del y_pred_df
     # calculate sums of actual and predicted values by shop-item-month
     # the code below assumes that same calendar month does not appear across multiple years in validation set
-    shop_item_month_df = full_df.groupby([full_df.index.month, 'shop_id', 'item_id']).agg('sum').reset_index()
-    logging.debug(f"Columns in shop_item_month_df are: {shop_item_month_df.columns.to_list()}")
+    shop_item_month_df = (
+        full_df.groupby([full_df.index.month, "shop_id", "item_id"])
+        .agg("sum")
+        .reset_index()
+    )
     # calculate RMSE for each month and then take the average of monthly values
     return (
-        shop_item_month_df
-        .groupby('sale_date')
+        shop_item_month_df.groupby("sale_date")
         .apply(
-            lambda x: np.sqrt(np.average((x['sid_shop_item_qty_sold_day'] - x['y_pred'])**2))
+            lambda x: np.sqrt(
+                np.average((x["sid_shop_item_qty_sold_day"] - x["y_pred"]) ** 2)
+            )
         )
         .mean()
     )
     # calculate monthly rmse
     # return np.sqrt(np.average((shop_item_df['sid_shop_item_qty_sold_day'] - shop_item_df['y_pred'])**2))
+
 
 def valid_frac(s):
     """Convert command-line fraction argument to float value.
@@ -124,6 +136,7 @@ def valid_frac(s):
             raise argparse.ArgumentTypeError(msg)
         return f
 
+
 def valid_date(s):
     """Convert command-line date argument to YY-MM datetime value.
 
@@ -146,6 +159,7 @@ def valid_date(s):
     except ValueError:
         msg = f"Not a valid date: {s}."
         raise argparse.ArgumentTypeError(msg)
+
 
 # https://lightgbm.readthedocs.io/en/latest/Parameters-Tuning.html
 # Deal with Over-fitting
@@ -201,31 +215,31 @@ def valid_date(s):
 #     'colsample_bytree' : [1.0]
 # }
 params = {
-    'objective' : ['tweedie'],
-    'metric' : ['rmse'], # tweedie, poisson, rmse, l1, l2
-    'boosting_type' : ['gbdt'],
+    "objective": ["tweedie"],
+    "metric": ["rmse"],  # tweedie, poisson, rmse, l1, l2
+    "boosting_type": ["gbdt"],
     # num_leaves - sets the maximum number of nodes per tree. Decrease num_leaves to reduce training time.
-    'num_leaves' : [40], # max number of leaves in one tree, 31 is default
+    "num_leaves": [40],  # max number of leaves in one tree, 31 is default
     # max_depth - this parameter is an integer that controls the maximum distance between the root node of each tree and a leaf node. Decrease max_depth to reduce training time. -1 is default (no limit)
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
-    'max_depth' : [5],
+    "max_depth": [5],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
-    'num_iterations' : [50],
+    "num_iterations": [50],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
-    'min_child_samples' : [100],
+    "min_child_samples": [100],
     # learning_rate: default is 0.1
-    'learning_rate' : [0.1],
+    "learning_rate": [0.1],
     # max_bin - max number of bins that feature values will be bucketed in, use larger value for better accuracy (may be slower), smaller value helps deal with over-fitting, default is 255
-    'max_bin' : [128],
+    "max_bin": [128],
     # subsample_for_bin - number of data that sampled to construct feature discrete bins, default: 200000
-    'subsample_for_bin' : [200000],
+    "subsample_for_bin": [200000],
     # bagging_fraction - for random selection of part of the data, without resampling, default: 1.0, constraints: 0.0 < bagging_fraction <= 1.0
-    'bagging_fraction' : [1.0],
+    "bagging_fraction": [1.0],
     # bagging_freq - frequency for bagging, 0 means disable bagging; k means perform bagging at every k iteration. default: 0
-    'bagging_freq' : [0],
+    "bagging_freq": [0],
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
-    'colsample_bytree' : [1.0]
+    "colsample_bytree": [1.0],
 }
 # additional parameters
 # pre_partition: https://lightgbm.readthedocs.io/en/latest/Parameters.html#pre_partition
@@ -265,6 +279,7 @@ params = {
 #
 # [dict(zip(b.keys(), v)) for v in list(product(*list(b.values())))]
 
+
 class LightGBMDaskLocal:
     # https://github.com/Nixtla/mlforecast/blob/main/nbs/distributed.forecast.ipynb
     """
@@ -288,7 +303,17 @@ class LightGBMDaskLocal:
     loop over train-valdation sets
     run model's fit method and compute predicted values and RMSE
     """
-    def __init__(self, curr_dt_time, n_workers, s3_path, startmonth, n_months_in_first_train_set, n_months_in_val_set, frac=None):
+
+    def __init__(
+        self,
+        curr_dt_time,
+        n_workers,
+        s3_path,
+        startmonth,
+        n_months_in_first_train_set,
+        n_months_in_val_set,
+        frac=None,
+    ):
         self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
         self.n_months_in_first_train_set = n_months_in_first_train_set
@@ -310,28 +335,48 @@ class LightGBMDaskLocal:
 
         try:
             # create Dask dataframe from partitioned Parquet dataset on S3 and persist it to cluster
-            self.full_dataset = dd.read_parquet(s3_path, index=False, engine='pyarrow').sample(frac=self.frac, random_state=42)
-            self.full_dataset['sale_date'] = self.full_dataset['sale_date'].astype('datetime64[ns]')
-            self.full_dataset['sid_shop_item_qty_sold_day'] = self.full_dataset['sid_shop_item_qty_sold_day'].astype('int16')
-            self.full_dataset = self.full_dataset.set_index('sale_date', sorted=False, npartitions='auto')
-            logging.debug(f"# of rows in full dataframe before removal of negative target values: {len(self.full_dataset)}")
-            self.full_dataset = self.full_dataset[self.full_dataset.sid_shop_item_qty_sold_day >= 0]
+            self.full_dataset = dd.read_parquet(
+                s3_path, index=False, engine="pyarrow"
+            ).sample(frac=self.frac, random_state=42)
+            self.full_dataset["sale_date"] = self.full_dataset["sale_date"].astype(
+                "datetime64[ns]"
+            )
+            self.full_dataset["sid_shop_item_qty_sold_day"] = self.full_dataset[
+                "sid_shop_item_qty_sold_day"
+            ].astype("int16")
+            self.full_dataset = self.full_dataset.set_index(
+                "sale_date", sorted=False, npartitions="auto"
+            )
+            logging.debug(
+                f"# of rows in full dataframe before removal of negative target values: {len(self.full_dataset)}"
+            )
+            self.full_dataset = self.full_dataset[
+                self.full_dataset.sid_shop_item_qty_sold_day >= 0
+            ]
             # call dataframe.set_index(), then repartition, then persist
             # https://docs.dask.org/en/latest/generated/dask.dataframe.DataFrame.set_index.html
             # set_index(sorted=False, npartitions='auto')
             # df = df.repartition(npartitions=df.npartitions // 100)
 
             # https://docs.dask.org/en/latest/generated/dask.dataframe.DataFrame.repartition.html
-            self.full_dataset = self.full_dataset.repartition(partition_size='100MB')
+            self.full_dataset = self.full_dataset.repartition(partition_size="100MB")
 
             self.full_dataset = self.client.persist(self.full_dataset)
             _ = wait([self.full_dataset])
-            logging.debug(f"# of rows in full dataframe after removal of negative target values: {len(self.full_dataset)}")
-            logging.debug(f"Earliest and latest dates in full dataframe are : {dd.compute(self.full_dataset.index.min(), self.full_dataset.index.max())}")
-            logging.debug(f"Data types of full Dask dataframe are: {self.full_dataset.dtypes}")
+            logging.debug(
+                f"# of rows in full dataframe after removal of negative target values: {len(self.full_dataset)}"
+            )
+            logging.debug(
+                f"Earliest and latest dates in full dataframe are : {dd.compute(self.full_dataset.index.min(), self.full_dataset.index.max())}"
+            )
+            logging.debug(
+                f"Data types of full Dask dataframe are: {self.full_dataset.dtypes}"
+            )
 
         except Exception:
-            logging.exception("Exception occurred while creating Dask dataframe and persisting it on the cluster.")
+            logging.exception(
+                "Exception occurred while creating Dask dataframe and persisting it on the cluster."
+            )
             # kill all active work, delete all data on the network, and restart the worker processes.
             self.client.restart()
             sys.exit(1)
@@ -399,15 +444,24 @@ class LightGBMDaskLocal:
         # self.rmse_results = defaultdict(list) # replace this variable by creating a key-value in
         # the self.hyper_dict dictionary with value containing list of RMSE values
         self.all_params_combs = list()
-        for params_comb_dict in (dict(zip(params.keys(), v)) for v in list(product(*list(params.values())))):
-        # for self.hyper_dict in hyperparameters:
+        for params_comb_dict in (
+            dict(zip(params.keys(), v)) for v in list(product(*list(params.values())))
+        ):
+            # for self.hyper_dict in hyperparameters:
             # self.params_combs_list.append(params_comb_dict)
             self.params_comb_dict = params_comb_dict
-            self.params_comb_dict['rmse_list_'] = list()
-            self.params_comb_dict['monthly_rmse_list_'] = list()
-            self.params_comb_dict['fit_times_list_'] = list()
+            self.params_comb_dict["rmse_list_"] = list()
+            self.params_comb_dict["monthly_rmse_list_"] = list()
+            self.params_comb_dict["fit_times_list_"] = list()
             try:
-                self.model = lgb.DaskLGBMRegressor(client=self.client, random_state=42, silent=False, tree_learner='data', force_row_wise=True, **params_comb_dict)
+                self.model = lgb.DaskLGBMRegressor(
+                    client=self.client,
+                    random_state=42,
+                    silent=False,
+                    tree_learner="data",
+                    force_row_wise=True,
+                    **params_comb_dict,
+                )
             except Exception:
                 logging.exception("Exception occurred while initializing Dask model.")
                 # kill all active work, delete all data on the network, and restart the worker processes.
@@ -419,12 +473,16 @@ class LightGBMDaskLocal:
                 for train, test in self.train_test_time_split():
                     self.fit(train).predict(test).rmse_all_folds(test)
 
-            self.params_comb_dict['avg_rmse_'] = mean(self.params_comb_dict['rmse_list_'])
-            self.params_comb_dict['monthly_avg_rmse_'] = mean(self.params_comb_dict['monthly_rmse_list_'])
+            self.params_comb_dict["avg_rmse_"] = mean(
+                self.params_comb_dict["rmse_list_"]
+            )
+            self.params_comb_dict["monthly_avg_rmse_"] = mean(
+                self.params_comb_dict["monthly_rmse_list_"]
+            )
             self.all_params_combs.append(self.params_comb_dict)
 
-        best_params = max(self.all_params_combs, key=lambda x: x['monthly_avg_rmse_'])
-        self.best_score_ = best_params['monthly_avg_rmse_']
+        best_params = max(self.all_params_combs, key=lambda x: x["monthly_avg_rmse_"])
+        self.best_score_ = best_params["monthly_avg_rmse_"]
         # remove non-parameter key-values from self.best_params (i.e., rmse_list_ and avg_rmse_, etc.)
         self.best_params_ = {k: v for k, v in best_params.items() if k in params}
 
@@ -444,10 +502,14 @@ class LightGBMDaskLocal:
                     f"and results is: {key}"
                 )
             except ClientError as e:
-                logging.exception("CSV file with LightGBM parameter combinations and results was not copied to S3.")
+                logging.exception(
+                    "CSV file with LightGBM parameter combinations and results was not copied to S3."
+                )
 
         else:
-            logging.debug("List of parameter-result dictionaries is empty and was not converted to CSV!")
+            logging.debug(
+                "List of parameter-result dictionaries is empty and was not converted to CSV!"
+            )
 
             # probably do the opposite:
             # loop over train-validation splits (persisting that data in memory)
@@ -479,39 +541,62 @@ class LightGBMDaskLocal:
 
         # (3 - n_months_in_first_train_set + 1) - (2 - 1)
         n_val_sets = (
-            (month_counter(self.startmonth) #self.startmonth is e.g. July 1, 2015
-            - self.n_months_in_first_train_set + 1)
-            - (self.n_months_in_val_set - 1)
-        )
+            month_counter(self.startmonth)  # self.startmonth is e.g. July 1, 2015
+            - self.n_months_in_first_train_set
+            + 1
+        ) - (self.n_months_in_val_set - 1)
 
         for m in range(n_val_sets):
-            end_date = self.startmonth + relativedelta(months=m + self.n_months_in_first_train_set - 1, day=31)
-            yield self.full_dataset.loc[:end_date], self.full_dataset.loc[end_date + timedelta(days=1):end_date + relativedelta(months=self.n_months_in_val_set, day=31)]
+            end_date = self.startmonth + relativedelta(
+                months=m + self.n_months_in_first_train_set - 1, day=31
+            )
+            yield self.full_dataset.loc[:end_date], self.full_dataset.loc[
+                end_date
+                + timedelta(days=1) : end_date
+                + relativedelta(months=self.n_months_in_val_set, day=31)
+            ]
             # self.train, self.test = self.time_split(self.full_dataset, self.end_date)
 
     def fit(self, train):
         try:
             start_time = time.perf_counter()
-            logging.debug(f"train X dtypes are {train[[col for col in train if col.startswith('pc')]].dtypes}")
-            logging.debug(f"train y type is {train['sid_shop_item_qty_sold_day'].dtype}")
-            self.model.fit(train[[col for col in train if col.startswith('pc')]].to_dask_array(lengths=True), train["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True))
+            logging.debug(
+                f"train X dtypes are {train[[col for col in train if col.startswith('pc')]].dtypes}"
+            )
+            logging.debug(
+                f"train y type is {train['sid_shop_item_qty_sold_day'].dtype}"
+            )
+            self.model.fit(
+                train[[col for col in train if col.startswith("pc")]].to_dask_array(
+                    lengths=True
+                ),
+                train["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True),
+            )
             assert self.model.fitted_
-            self.params_comb_dict['fit_times_list_'].append(time.perf_counter() - start_time)
+            self.params_comb_dict["fit_times_list_"].append(
+                time.perf_counter() - start_time
+            )
 
             return self
 
         except Exception:
-            logging.exception("Exception occurred while fitting model on train data during walk-forward validation.")
+            logging.exception(
+                "Exception occurred while fitting model on train data during walk-forward validation."
+            )
             # kill all active work, delete all data on the network, and restart the worker processes.
             self.client.restart()
             sys.exit(1)
 
     def predict(self, test):
         try:
-            self.y_pred =  self.model.predict(test[[col for col in test if col.startswith('pc')]])
+            self.y_pred = self.model.predict(
+                test[[col for col in test if col.startswith("pc")]]
+            )
             return self
         except Exception:
-            logging.exception("Exception occurred while computing predicted values on the test data.")
+            logging.exception(
+                "Exception occurred while computing predicted values on the test data."
+            )
             # kill all active work, delete all data on the network, and restart the worker processes.
             self.client.restart()
             sys.exit(1)
@@ -522,13 +607,25 @@ class LightGBMDaskLocal:
             # logging.debug(f"Data type of self.y_pred is: {type(self.y_pred)}")
             # logging.debug(f"Shape of test['sid_shop_item_qty_sold_day'] is: {test['sid_shop_item_qty_sold_day'].compute().shape}")
             # logging.debug(f"Shape of self.y_pred is: {self.y_pred.compute().shape}")
-            self.params_comb_dict['rmse_list_'].append(calc_rmse(test["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True), self.y_pred.compute_chunk_sizes()))
+            self.params_comb_dict["rmse_list_"].append(
+                calc_rmse(
+                    test["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True),
+                    self.y_pred.compute_chunk_sizes(),
+                )
+            )
             # self.rmse_results[json.dumps(self.hyper_dict)].append(calc_rmse(test[["sid_shop_item_qty_sold_day"]], self.y_pred))
 
-            self.params_comb_dict['monthly_rmse_list_'].append(calc_monthly_rmse(test[['shop_id', 'item_id', 'sid_shop_item_qty_sold_day']], self.y_pred))
+            self.params_comb_dict["monthly_rmse_list_"].append(
+                calc_monthly_rmse(
+                    test[["shop_id", "item_id", "sid_shop_item_qty_sold_day"]],
+                    self.y_pred,
+                )
+            )
 
         except Exception:
-            logging.exception("Exception occurred while computing RMSE on the test data.")
+            logging.exception(
+                "Exception occurred while computing RMSE on the test data."
+            )
             # kill all active work, delete all data on the network, and restart the worker processes.
             self.client.restart()
             sys.exit(1)
@@ -538,33 +635,47 @@ class LightGBMDaskLocal:
         https://stackoverflow.com/questions/55208734/save-lgbmregressor-model-from-python-lightgbm-package-to-disc/55209076
         """
         try:
-            self.best_model = lgb.DaskLGBMRegressor(client=self.client, random_state=42, silent=False, tree_learner='data', force_row_wise=True, **self.best_params_)
-            self.best_model.fit(self.full_dataset[[col for col in self.full_dataset if col.startswith('pc')]].to_dask_array(lengths=True), self.full_dataset["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True))
-            output_txt = str(model_path).split('/')[-1]
+            self.best_model = lgb.DaskLGBMRegressor(
+                client=self.client,
+                random_state=42,
+                silent=False,
+                tree_learner="data",
+                force_row_wise=True,
+                **self.best_params_,
+            )
+            self.best_model.fit(
+                self.full_dataset[
+                    [col for col in self.full_dataset if col.startswith("pc")]
+                ].to_dask_array(lengths=True),
+                self.full_dataset["sid_shop_item_qty_sold_day"].to_dask_array(
+                    lengths=True
+                ),
+            )
+            output_txt = str(model_path).split("/")[-1]
             booster = self.best_model.booster_.save_model(output_txt)
 
             # output_txt = str(model_path).split('/')[-1]
             # global s3_client
             s3_client = boto3.client("s3")
-            response = s3_client.upload_file(output_txt, "sales-demand-data", output_txt)
-            logging.info(
-                f"Name of saved model uploaded to S3 is: {output_txt}"
+            response = s3_client.upload_file(
+                output_txt, "sales-demand-data", output_txt
             )
+            logging.info(f"Name of saved model uploaded to S3 is: {output_txt}")
 
         except (Exception, ClientError):
-            logging.exception("Exception occurred while fitting model on the full dataset and saving the booster to file on S3.")
+            logging.exception(
+                "Exception occurred while fitting model on the full dataset and saving the booster to file on S3."
+            )
             # kill all active work, delete all data on the network, and restart the worker processes.
             self.client.restart()
             sys.exit(1)
+
 
 def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument(
-        "n_workers",
-        metavar="<n_workers>",
-        help="number of Dask workers",
-        type=int,
+        "n_workers", metavar="<n_workers>", help="number of Dask workers", type=int,
     )
 
     parser.add_argument(
@@ -611,7 +722,9 @@ def main():
             "allow for the provided length of train period, or no months "
             "remain for any validation period."
         )
-    elif (month_counter(args.startmonth) - args.n_months_in_first_train_set + 1) < args.n_months_in_val_set:
+    elif (
+        month_counter(args.startmonth) - args.n_months_in_first_train_set + 1
+    ) < args.n_months_in_val_set:
         raise argparse.ArgumentError(
             "The provided combination of start month and number of months in "
             "first train set does not allow for the provided number of months "
@@ -623,7 +736,7 @@ def main():
     log_dir = Path.cwd().joinpath("logs")
     path = Path(log_dir)
     path.mkdir(exist_ok=True)
-    curr_dt_time = datetime.now().strftime('%Y_%m_%d_%H_%M')
+    curr_dt_time = datetime.now().strftime("%Y_%m_%d_%H_%M")
     log_fname = f"logging_{curr_dt_time}_lightgbm.log"
     log_path = log_dir.joinpath(log_fname)
 
@@ -658,9 +771,7 @@ def main():
         instance_metadata = dict()
         instance_metadata["EC2 instance ID"] = ec2_metadata.instance_id
         instance_metadata["EC2 instance type"] = ec2_metadata.instance_type
-        instance_metadata[
-            "EC2 instance public hostname"
-        ] = ec2_metadata.public_hostname
+        instance_metadata["EC2 instance public hostname"] = ec2_metadata.public_hostname
 
         f = lambda x: ": ".join(x)
         r = list(map(f, list(instance_metadata.items())))
@@ -686,7 +797,13 @@ def main():
     )
 
     model = LightGBMDaskLocal(
-        curr_dt_time, args.n_workers, args.s3_path, args.startmonth, args.n_months_in_first_train_set, args.n_months_in_val_set, frac=args.frac
+        curr_dt_time,
+        args.n_workers,
+        args.s3_path,
+        args.startmonth,
+        args.n_months_in_first_train_set,
+        args.n_months_in_val_set,
+        frac=args.frac,
     )
     model.gridsearch_wfv(params)
     model.refit_and_save(model_path)
@@ -699,9 +816,9 @@ def main():
     except ClientError as e:
         logging.exception("Log file was not copied to S3.")
 
+
 if __name__ == "__main__":
     main()
-
 
 
 #
