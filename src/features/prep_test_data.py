@@ -181,6 +181,7 @@ import pickle as pk
 import platform
 import sys
 import threading
+import time
 
 import boto3
 from botocore.exceptions import ClientError
@@ -235,11 +236,15 @@ class MultiThreadDBClass(threading.Thread):
                 logging.debug(line.strip("\n"))
             logging.info("Connected to the PostgreSQL database.")
 
+            with self.conn.cursor() as cur:
+                cur.execute("SET random_page_cost = 1")
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
+
         except (Exception, psycopg2.DatabaseError) as e:
             logging.exception("Exception occurred during database connection.")
             self.exception = e
 
-    @Timer(logger=logging.info)
+    # @Timer(logger=logging.info)
     def execute_query(self, sql):
         """ Execute individual SQL query.
 
@@ -252,11 +257,14 @@ class MultiThreadDBClass(threading.Thread):
             del self.conn.notices[
                 :
             ]  # clear the notices list before executing next query
-            with self.conn.cursor() as cur:
-                for q in sql.split("; "):
-                    cur.execute(q, self.kwargs)
-            for line in self.conn.notices:
-                logging.debug(line.strip("\n"))
+            if self.conn.closed == 0:
+                with self.conn.cursor() as cur:
+                    for q in sql.split("; "):
+                        # logging.debug(f"q is {q}")
+                        cur.execute(q, self.kwargs)
+                        logging.debug(f"cur.statusmessage is {cur.statusmessage}")
+                for line in self.conn.notices:
+                    logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as e:
             logging.exception(
                 "Exception occurred in execute_query function. "
@@ -287,7 +295,7 @@ class MultiThreadDBClass(threading.Thread):
                 i += 1
 
             global n_threads_finished
-            n_threads_finished += 1
+            n_threads_finished[0] += 1
 
         except (Exception, psycopg2.DatabaseError) as e:
             logging.exception("Exception occurred in run() function.")
@@ -351,6 +359,10 @@ class SingleThreadDBClass:
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
             logging.info("Connected to the PostgreSQL database.")
+
+            with self.conn.cursor() as cur:
+                cur.execute("SET random_page_cost = 1")
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred during database connection.")
@@ -439,6 +451,7 @@ class SingleThreadDBClass:
                 )
                 logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -480,6 +493,7 @@ class SingleThreadDBClass:
                 for q in sql.split("; "):
                     logging.debug(f"SQL query to be executed: {q}")
                     cur.execute(q)
+                    logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -525,7 +539,9 @@ class SingleThreadDBClass:
             }
 
             sql_col_list = []
-            with open(f"./{csv_path}", "r") as col_file:
+            # f"./csv/{csv_fname}"
+            # with open(csv_path, "w") as f:
+            with open(csv_path, "r") as col_file:
                 csv_reader = csv.reader(col_file, delimiter=",")
                 next(csv_reader, None)  # skip header row
                 for row in csv_reader:
@@ -549,7 +565,7 @@ class SingleThreadDBClass:
                     "LEFT JOIN id_new_day id "
                     "ON sid.item_id = id.item_id "
                     "LEFT JOIN sd_new_day sd "
-                    "ON sid.shop_id = id.shop_id "
+                    "ON sid.shop_id = sd.shop_id "
                     "LEFT JOIN dates d "
                     "ON sid.sale_date = d.sale_date "
                     "LEFT JOIN items i "
@@ -564,6 +580,7 @@ class SingleThreadDBClass:
                 )
                 logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
         except (Exception, psycopg2.DatabaseError) as error:
             logging.exception("Exception occurred in export_features function.")
             if self.conn is not None:
@@ -581,7 +598,7 @@ class SingleThreadDBClass:
             sys.exit(1)
 
     @Timer(logger=logging.info)
-    def append_features(self, csv_path):
+    def append_features(self, csv_path, params=None):
         """ Append individual features to the appropriate existing tables
         (e.g., id_... features are appended to the item_dates table).
 
@@ -590,6 +607,8 @@ class SingleThreadDBClass:
         csv_path : str or pathlib.Path() object
             Filepath (directory and filename) of CSV file containing list of
             columns and tables that those columns belong to
+        params : list, tuple or dict, optional, default: None
+            List of parameters to pass to execute method
         """
         try:
             # insert into items_ver(item_id, item_group, name)
@@ -600,7 +619,8 @@ class SingleThreadDBClass:
             sd_col_list = []
             sid_new_col_list = []
             sid_main_col_list = []
-            with open(f"./{csv_path}", "r") as col_file:
+            with open(csv_path, "r") as col_file:
+            # with open(f"./{csv_path}", "r") as col_file:
                 csv_reader = csv.reader(col_file, delimiter=",")
                 next(csv_reader, None)  # skip header row
                 for row in csv_reader:
@@ -613,7 +633,7 @@ class SingleThreadDBClass:
                     elif row[1] == "sid_new_day":
                         sid_new_col_list.append(row[2])
                         # sid_col_list.append(".".join([col_name_dict[row[1]], row[2]]))
-                    elif row[1] == "shop_item_dates":
+                    elif row[1] == "shop_item_dates" and row[2] != "sid_shop_item_days_since_prev_sale":
                         sid_main_col_list.append(row[2])
             id_cols_to_select = ", ".join(id_col_list)
             sd_cols_to_select = ", ".join(sd_col_list)
@@ -628,18 +648,25 @@ class SingleThreadDBClass:
             ]  # clear the notices list before executing next query
             with self.conn.cursor() as cur:
                 sql = (
+                    "DELETE FROM item_dates "
+                    "WHERE sale_date = %(curr_date)s; "
+                    "DELETE FROM shop_dates "
+                    "WHERE sale_date = %(curr_date)s; "
+                    "DELETE FROM shop_item_dates "
+                    "WHERE sale_date = %(curr_date)s; "
                     f"INSERT INTO item_dates ({id_cols_to_select}) "
                     f"SELECT {id_cols_to_select} FROM id_new_day; "
                     f"INSERT INTO shop_dates ({sd_cols_to_select}) "
                     f"SELECT {sd_cols_to_select} FROM sd_new_day; "
                     f"INSERT INTO shop_item_dates ({sid_cols_to_select}) "
-                    f"SELECT {sid_cols_to_select} FROM sid_new_day; "
+                    f"SELECT {sid_cols_to_select} FROM sid_new_day;"
                     # SOME OF THE SID_ FEATURES NEED TO BE INSERTED INTO OTHER SID_ TABLES -
                     # for now, decided not to insert anything into those other sid_ tables
                 )
                 for q in sql.split("; "):
                     logging.debug(f"SQL query to be executed: {q}")
-                    cur.execute(q)
+                    cur.execute(q, params)
+                    logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -686,6 +713,7 @@ class SingleThreadDBClass:
                     for q in sql.split("; "):
                         logging.debug(f"SQL query to be executed: {q}")
                         cur.execute(q)
+                        logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
                 for line in self.conn.notices:
                     logging.debug(line.strip("\n"))
@@ -704,6 +732,7 @@ class SingleThreadDBClass:
                 )
                 logging.debug(f"Query to be executed: {sql}")
                 cur.execute(sql)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -754,6 +783,7 @@ class SingleThreadDBClass:
                     sql = SQL(sql_str).format(Identifier(model_col))
                     logging.debug(f"Query to be executed: {sql_str}")
                     cur.execute(sql)
+                    logging.debug(f"cur.statusmessage is {cur.statusmessage}")
                 for line in self.conn.notices:
                     logging.debug(line.strip("\n"))
 
@@ -789,6 +819,7 @@ class SingleThreadDBClass:
                 for q in (sql1, sql2, sql3):
                     logging.debug(f"SQL query to be executed: {q}")
                     cur.execute(q)
+                    logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
@@ -836,7 +867,8 @@ class SingleThreadDBClass:
             )
             try:
                 logging.debug(f"Query to be executed: {sql}")
-                n_cols = cur.execute(sql).fetchone()[0]
+                cur.execute(sql)
+                n_cols = cur.fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
                 logging.exception(
@@ -848,7 +880,8 @@ class SingleThreadDBClass:
             sql = "SELECT count(*) FROM daily_sid_predictions AS n_rows"
             try:
                 logging.debug(f"Query to be executed: {sql}")
-                n_rows = cur.execute(sql).fetchone()[0]
+                cur.execute(sql)
+                n_rows = cur.fetchone()[0]
             except TypeError as e:
                 row_and_col_cts_can_be_used = False
                 logging.exception(
@@ -904,6 +937,7 @@ class SingleThreadDBClass:
                 sql = SQL(sql_str).format(Identifier(model_col))
                 logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             with self.conn.cursor() as cur:
                 sql_str = (
                     "WITH item_total AS ("
@@ -919,6 +953,7 @@ class SingleThreadDBClass:
                 sql = SQL(sql_str).format(Identifier(model_col))
                 logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             with self.conn.cursor() as cur:
                 sql_str = (
                     "WITH shop_total AS ("
@@ -934,6 +969,7 @@ class SingleThreadDBClass:
                 sql = SQL(sql_str).format(Identifier(model_col))
                 logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             with self.conn.cursor() as cur:
                 sql_str = (
                     "UPDATE shop_item_dates sid "
@@ -945,6 +981,7 @@ class SingleThreadDBClass:
                 sql = SQL(sql_str).format(Identifier("dsp", model_col))
                 logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             with self.conn.cursor() as cur:
                 # insert non-zero sid predicted quantity into sales_cleaned
                 sql_str = (
@@ -956,6 +993,7 @@ class SingleThreadDBClass:
                 sql = SQL(sql_str).format(Identifier(model_col))
                 logging.debug(f"Query to be executed: {sql_str}")
                 cur.execute(sql, params)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
             for line in self.conn.notices:
                 logging.debug(line.strip("\n"))
         except (Exception, psycopg2.DatabaseError) as error:
@@ -1102,7 +1140,7 @@ def main():
 
     # objects needed for prediction step
     # load mapping of PostgreSQL types that exist in sales database to Pandas data types
-    with open("pd_types_from_psql_mapping.json", "r") as f:
+    with open("./features/pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
     del pd_types["sale_date"]  # remove sale_date as it will be included in parse_dates=
     # change types of binary features to 'uint8'
@@ -1126,6 +1164,7 @@ def main():
     pd_types = {k: "uint8" if k in bin_features else v for k, v in pd_types.items()}
     # DOWNLOAD MODEL, PCA AND SCALER FILES FROM S3 TO EC2 INSTANCE
     # s3_client.download_file('BUCKET_NAME', 'OBJECT_NAME', 'FILE_NAME')
+    s3_client = boto3.client("s3")
     s3_client.download_file(
         "sales-demand-data", f"scaler_{args.pkl_dt_time}.pkl", "scaler.pkl"
     )
@@ -1157,7 +1196,7 @@ def main():
         logging.info(f"Starting to run predictions for {curr_date_str}...")
 
         first_day = curr_date == datetime.date(2015, 11, 1)
-        day_counter = curr_dt.day
+        day_counter = curr_date.day
         first_model = args.modelnum == 1
         params = {"curr_date": curr_date}
 
@@ -1181,10 +1220,12 @@ def main():
             ]
             for s in three_strings
         ]
+        three_lists[0].insert(0, lag_query)
 
+        # n_threads_finished = [0]
         threads = [
             MultiThreadDBClass(
-                args=(three_lists[0].insert(0, lag_query)), kwargs=params
+                args=(three_lists[0]), kwargs=params
             ),
             MultiThreadDBClass(args=(three_lists[1]), kwargs=params),
             MultiThreadDBClass(args=(three_lists[2]), kwargs=params),
@@ -1193,10 +1234,10 @@ def main():
             t.start()
 
         # main thread looks at the status of all threads
-        n_threads_finished = 0
         try:
             # while True:
-            while n_threads_finished < 3:
+            global n_threads_finished
+            while n_threads_finished[0] < 3:
                 for t in threads:
                     if t.exception:
                         # there was an error in a thread - raise it in main thread too
@@ -1232,6 +1273,8 @@ def main():
             for t in threads:
                 # threads will know how to clean up when stopped
                 t.stop()
+            # global n_threads_finished
+            n_threads_finished = [0]
 
         col_names_csv_path = csv_dir.joinpath(cols_csv_fname)
         # RUN SUMMARY QUERY TO GENERATE COLUMN LIST FOR THE TABLES TO BE JOINED
@@ -1242,15 +1285,21 @@ def main():
 
         db.export_features(col_names_csv_path)
 
-        db.append_features(col_names_csv_path)
+        db.append_features(col_names_csv_path, params)
 
         # HERE IS WHERE PREDICTIONS ARE GENERATED
         # load CSV of features into a pandas dataframe
-        s3_client = boto3.client("s3")
         csv_body = s3_client.get_object(
             Bucket="my-rds-exports", Key="test_data_for_scoring.csv"
         ).get("Body")
         df = pd.read_csv(csv_body, dtype=pd_types, parse_dates=["sale_date"])
+        # check to make sure that there are no null values among feature columns
+        if df.isna().any().any():
+            logging.debug(
+                "Dataframe with test data for scoring has "
+                f"{', '.join(df.columns[df.isna().any()])} columns with nulls"
+            )
+            sys.exit(1)
         # extract shop_id, item_id and sale_date cols from df and put them into numpy array
         id_cols_arr = df[["shop_id", "item_id", "sale_date"]].to_numpy()
         # call function to preprocess features
@@ -1268,7 +1317,12 @@ def main():
         # DO I NEED TO SPECIFY WHICH PC COLUMN IS WHICH - I.E. WHAT FORMAT SHOULD
         # THE DATA BE PROVIDED TO LIGHTGBM?
         # e.g., preds_model1_{day_counter}.csv
-        pred_arr = model.predict(pca_transformed_data)
+        pred_arr = model.predict(pca_transformed_data).reshape(-1,1)
+        logging.debug(
+            "min, max, mean of prediction array before rounding are: "
+            f"{pred_arr.min()}, {pred_arr.max()}, and {pred_arr.mean()}"
+        )
+        pred_arr = np.rint(pred_arr).astype(int)
         full_pred_df = pd.DataFrame(
             np.hstack((id_cols_arr, pred_arr)),
             columns=["shop_id", "item_id", "sale_date", f"model{args.modelnum}"],
@@ -1326,7 +1380,7 @@ def main():
     # close database connection
     db.close_db_conn()
 
-    if args.stop == True:
+    if args.stop:
         stop_instance()
 
     # copy log file to S3 bucket if running script on a EC2 instance
@@ -1341,6 +1395,7 @@ def main():
 
 
 if __name__ == "__main__":
+    n_threads_finished = [0]
     main()
 
 
