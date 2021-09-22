@@ -394,7 +394,7 @@ def pca(
     csv_list = list_csvs(first_mon=first_mon)
     assert isinstance(csv_list, list), f"csv_list is not a list, but {type(csv_list)}!"
 
-    with open("pd_types_from_psql_mapping.json", "r") as f:
+    with open("./features/pd_types_from_psql_mapping.json", "r") as f:
         pd_types = json.load(f)
 
     del pd_types["sale_date"]  # remove sale_date as it will be included in parse_dates=
