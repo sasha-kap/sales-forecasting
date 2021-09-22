@@ -538,7 +538,11 @@ all_queries_str = (
     "UPDATE sd_new_day nd "
     "SET sd_shop_first_month = 1 WHERE sd_shop_days_since_first_sale <= 30; "
     "UPDATE sd_new_day nd "
+    "SET sd_shop_first_month = 0 WHERE sd_shop_first_month IS NULL; "
+    "UPDATE sd_new_day nd "
     "SET sd_shop_first_week = 1 WHERE sd_shop_days_since_first_sale <= 6; "
+    "UPDATE sd_new_day nd "
+    "SET sd_shop_first_week = 0 WHERE sd_shop_first_week IS NULL; "
     # expanding quantity sold stats
     "ALTER TABLE sd_new_day "
     "ADD COLUMN sd_shop_expand_qty_max int, "
