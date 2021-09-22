@@ -540,7 +540,7 @@ def main():
         )
         run_query(sql)
 
-    if args.stop == True:
+    if args.stop:
         stop_instance()
 
 if __name__ == "__main__":
