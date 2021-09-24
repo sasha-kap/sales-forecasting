@@ -72,8 +72,42 @@ def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
     )
 
 
-def calc_rmse(y_true, y_pred):
+def calc_rmse(y_true, y_pred, get_stats):
+    if get_stats:
+        pred_stats_to_csv(y_true, y_pred)
     return mean_squared_error(y_true, y_pred, squared=False, compute=True)
+
+
+def pred_stats_to_csv(y_true, y_pred, output_csv="pred_value_stats.csv"):
+    y_true_df = pd.DataFrame(y_true.compute(), columns=["y_true"])
+    y_pred_df = pd.DataFrame(
+        y_pred.compute(), columns=["y_pred"], index=y_true_df.index
+    )  # convert Dask array to Pandas DF
+    full_df = pd.concat(
+        [y_true_df, y_pred_df], axis=1
+    )  # join actual and predicted values
+    del y_true_df
+    del y_pred_df
+
+    stats_df = (
+        full_df.groupby("y_true")
+        .describe(percentiles=[0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99])
+        .droplevel(level=0, axis=1)
+        .reset_index()
+    )
+    stats_df.to_csv(output_csv, index=False)
+    s3_client = boto3.client("s3")
+    try:
+        s3_client.upload_file(output_csv, "sales-demand-data", output_csv)
+        logging.info(
+            "CSV file with descriptive stats of predicted values "
+            "successfully copied to S3."
+        )
+    except ClientError as e:
+        logging.exception(
+            "CSV file with descriptive stats of predicted values "
+            "was not copied to S3."
+        )
 
 
 def calc_monthly_rmse(y_true_w_id_cols, y_pred):
@@ -224,11 +258,11 @@ params = {
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
     "max_depth": [5],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
-    "num_iterations": [50],
+    "num_iterations": [100],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
     "min_child_samples": [100],
     # learning_rate: default is 0.1
-    "learning_rate": [0.1],
+    "learning_rate": [0.01],
     # max_bin - max number of bins that feature values will be bucketed in, use larger value for better accuracy (may be slower), smaller value helps deal with over-fitting, default is 255
     "max_bin": [128],
     # subsample_for_bin - number of data that sampled to construct feature discrete bins, default: 200000
@@ -240,6 +274,7 @@ params = {
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
     "colsample_bytree": [1.0],
+    "tweedie_variance_power": [1.2],
 }
 # additional parameters
 # pre_partition: https://lightgbm.readthedocs.io/en/latest/Parameters.html#pre_partition
@@ -470,8 +505,8 @@ class LightGBMDaskLocal:
 
             # call method that loops over train-validation sets
             with performance_report(filename=f"dask_report_{self.curr_dt_time}.html"):
-                for train, test in self.train_test_time_split():
-                    self.fit(train).predict(test).rmse_all_folds(test)
+                for train, test, get_stats in self.train_test_time_split():
+                    self.fit(train).predict(test).rmse_all_folds(test, get_stats)
 
             self.params_comb_dict["avg_rmse_"] = mean(
                 self.params_comb_dict["rmse_list_"]
@@ -550,11 +585,16 @@ class LightGBMDaskLocal:
             end_date = self.startmonth + relativedelta(
                 months=m + self.n_months_in_first_train_set - 1, day=31
             )
-            yield self.full_dataset.loc[:end_date], self.full_dataset.loc[
-                end_date
-                + timedelta(days=1) : end_date
-                + relativedelta(months=self.n_months_in_val_set, day=31)
-            ]
+            get_stats = m == n_val_sets - 1
+            yield (
+                self.full_dataset.loc[:end_date],
+                self.full_dataset.loc[
+                    end_date
+                    + timedelta(days=1) : end_date
+                    + relativedelta(months=self.n_months_in_val_set, day=31)
+                ],
+                get_stats
+            )
             # self.train, self.test = self.time_split(self.full_dataset, self.end_date)
 
     def fit(self, train):
@@ -601,7 +641,7 @@ class LightGBMDaskLocal:
             self.client.restart()
             sys.exit(1)
 
-    def rmse_all_folds(self, test):
+    def rmse_all_folds(self, test, get_stats):
         try:
             # logging.debug(f"Data type of test['sid_shop_item_qty_sold_day'] is: {type(test['sid_shop_item_qty_sold_day'])}")
             # logging.debug(f"Data type of self.y_pred is: {type(self.y_pred)}")
@@ -611,6 +651,7 @@ class LightGBMDaskLocal:
                 calc_rmse(
                     test["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True),
                     self.y_pred.compute_chunk_sizes(),
+                    get_stats,
                 )
             )
             # self.rmse_results[json.dumps(self.hyper_dict)].append(calc_rmse(test[["sid_shop_item_qty_sold_day"]], self.y_pred))
