@@ -56,7 +56,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from sklearn.decomposition import IncrementalPCA
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 
 s3_client = boto3.client("s3")
 
@@ -125,7 +125,7 @@ def list_csvs(bucket="my-rds-exports", prefix="shops", first_mon=""):
 # shows how to dump PCA object to pickle file
 
 
-def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
+def plot_pca_components(fit_pca, first_mon, frac, scale_bins, encoder, curr_dt_time):
     """Plot cumulative explained variance of all PCs from PCA results.
 
     Parameters:
@@ -138,6 +138,8 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
         Fraction of rows that was sampled from CSVs
     scale_bins : bool
         Whether binary columns were scaled with StandardScaler prior to PCA
+    encoder : str
+        Type of encoder to apply to categorical features: dummy or ordinal
     curr_dt_time : str
         Date-time string created at start of script and to be used to insert
         consistent timestamp in filenames
@@ -173,6 +175,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
             f"# Samples: {fit_pca.n_samples_seen_:,}",
             f"# Components: {fit_pca.n_components_}",
             f"Binary cols scaled: {scale_bins}",
+            f"Encoding: {encoder}",
         )
     )
     ax.text(
@@ -195,7 +198,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
         logging.exception("PCA explained variance plot file was not copied to S3.")
 
 
-def preprocess_chunk(df, null_col_dict, index):
+def preprocess_chunk(df, encoder, null_col_dict, index):
     """Perform necessary preprocessing steps on each chunk of CSV data prior
     to passing data to StandardScaler.
 
@@ -203,6 +206,8 @@ def preprocess_chunk(df, null_col_dict, index):
     -----------
     df : DataFrame
         Chunk of CSV data
+    encoder : str
+        Type of encoder to apply to categorical features: dummy or ordinal
     null_col_dict : dict
         Dictionary of columns that have null values in CSVs, with their
         data types that need to be assigned after nulls are filled with 0's
@@ -235,7 +240,7 @@ def preprocess_chunk(df, null_col_dict, index):
     )
     # errors='ignore' is added to suppress error when sid_coef_var_price is not found
     # among existing labels
-    df.drop(cols_to_drop, axis=1, inplace=True, errors='ignore')
+    df.drop(cols_to_drop, axis=1, inplace=True, errors="ignore")
 
     # fill columns with null values and change data type from float to the type
     # previously determined for each column
@@ -264,7 +269,6 @@ def preprocess_chunk(df, null_col_dict, index):
         "id_num_unique_shops_prior_to_day"
     ].astype("int16")
 
-    # encode categorical features as dummies
     broad_cats = [
         "Аксессуары",
         "Кино",
@@ -282,68 +286,120 @@ def preprocess_chunk(df, null_col_dict, index):
         "Чистые",
         "Книги",
     ]
-    prefix = "i_item_cat_broad"
-    df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
-    cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
-    df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype("uint8")
-
     mons_of_first_sale = [x for x in range(13)]
-    prefix = "i_item_first_mon"
-    df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
-    cols = df_first_months.columns.union(
-        [prefix + "_" + str(x) for x in mons_of_first_sale]
-    )
-    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype(
-        "uint8"
-    )
-
     years = [2013, 2014, 2015]
-    prefix = "d_year"
-    df_years = pd.get_dummies(df.d_year, prefix=prefix)
-    cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
-    df_years = df_years.reindex(cols, axis=1, fill_value=0).astype("uint8")
-
     dow = [x for x in range(7)]
-    prefix = "d_day_of_week"
-    df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
-    cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
-    df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype("uint8")
-
     months = [x for x in range(12)]
-    prefix = "d_month"
-    df_months = pd.get_dummies(df.d_month, prefix=prefix)
-    cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
-    df_months = df_months.reindex(cols, axis=1, fill_value=0).astype("uint8")
-
     quarters = [x for x in range(1, 5)]
-    prefix = "d_quarter"
-    df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
-    cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
-    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype("uint8")
-    # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
 
-    df = pd.concat(
-        [
-            df.drop(
-                [
-                    "i_item_category_broad",
-                    "i_item_mon_of_first_sale",
-                    "d_year",
-                    "d_day_of_week",
-                    "d_month",
-                    "d_quarter_of_year",
-                ],
-                axis=1,
-            ),
-            df_cats,
-            df_first_months,
-            df_years,
-            df_dow,
-            df_months,
-            df_quarters,
-        ],
-        axis=1,
-    )
+    if encoder == "dummy":
+
+        # encode categorical features as dummies
+        prefix = "i_item_cat_broad"
+        df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
+        cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
+        df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype("uint8")
+
+        prefix = "i_item_first_mon"
+        df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
+        cols = df_first_months.columns.union(
+            [prefix + "_" + str(x) for x in mons_of_first_sale]
+        )
+        df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype(
+            "uint8"
+        )
+
+        prefix = "d_year"
+        df_years = pd.get_dummies(df.d_year, prefix=prefix)
+        cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
+        df_years = df_years.reindex(cols, axis=1, fill_value=0).astype("uint8")
+
+        prefix = "d_day_of_week"
+        df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
+        cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
+        df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype("uint8")
+
+        prefix = "d_month"
+        df_months = pd.get_dummies(df.d_month, prefix=prefix)
+        cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
+        df_months = df_months.reindex(cols, axis=1, fill_value=0).astype("uint8")
+
+        prefix = "d_quarter"
+        df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
+        cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
+        df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype("uint8")
+        # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
+
+        df = pd.concat(
+            [
+                df.drop(
+                    [
+                        "i_item_category_broad",
+                        "i_item_mon_of_first_sale",
+                        "d_year",
+                        "d_day_of_week",
+                        "d_month",
+                        "d_quarter_of_year",
+                    ],
+                    axis=1,
+                ),
+                df_cats,
+                df_first_months,
+                df_years,
+                df_dow,
+                df_months,
+                df_quarters,
+            ],
+            axis=1,
+        )
+
+    elif encoder == "ordinal":
+
+        enc = OrdinalEncoder(
+            categories=[
+                broad_cats,
+                mons_of_first_sale,
+                years,
+                dow,
+                months,
+                quarters,
+                [x for x in range(1, 54)],  # for d_week_of_year
+            ],
+            dtype="uint8",
+        )
+        cat_col_names = [
+            "i_item_category_broad",
+            "i_item_mon_of_first_sale",
+            "d_year",
+            "d_day_of_week",
+            "d_month",
+            "d_quarter_of_year",
+            "d_week_of_year",
+        ]
+        # convert category types to uint8/16
+        df['i_item_mon_of_first_sale'] = df['i_item_mon_of_first_sale'].astype('uint8')
+        df['d_year'] = df['d_year'].astype('uint16')
+        cat_cols = enc.fit_transform(df[cat_col_names])
+        cat_cols_df = pd.DataFrame(cat_cols, columns=cat_col_names, index=df.index)
+
+        df = pd.concat(
+            [
+                df.drop(
+                    [
+                        "i_item_category_broad",
+                        "i_item_mon_of_first_sale",
+                        "d_year",
+                        "d_day_of_week",
+                        "d_month",
+                        "d_quarter_of_year",
+                        "d_week_of_year",
+                    ],
+                    axis=1,
+                ),
+                cat_cols_df,
+            ],
+            axis=1,
+        )
 
     # check each chunk for infinity values and stop script if any values are found
     if df[df.isin([np.inf, -np.inf])].count().any():
@@ -364,6 +420,7 @@ def pca(
     first_mon="",
     frac=1.0,
     scale_bins=False,
+    encoder="",
     curr_dt_time="",
 ):
     """Implement StandardScaler and IncrementalPCA with partial_fit() methods.
@@ -383,6 +440,8 @@ def pca(
     scale_bins : bool
         Whether binary columns are to be scaled with StandardScaler prior to PCA
         (default: False)
+    encoder : str
+        Type of encoder to apply to categorical features: dummy or ordinal
     curr_dt_time : str
         Date-time string created at start of script and to be used to insert
         consistent timestamp in filenames
@@ -557,6 +616,7 @@ def pca(
                         chunk.sample(frac=frac, random_state=42).sort_values(
                             by=["shop_id", "item_id", "sale_date"]
                         ),
+                        encoder,
                         null_col_dict,
                         index,
                         # scale_bins=scale_bins,
@@ -606,6 +666,7 @@ def pca(
                 chunk.sample(frac=frac, random_state=42).sort_values(
                     by=["shop_id", "item_id", "sale_date"]
                 ),
+                encoder,
                 null_col_dict,
                 index,
                 # scale_bins=scale_bins,
@@ -648,7 +709,7 @@ def pca(
             f"The estimated number of principal components: {sklearn_pca.n_components_}"
         )
         logging.info(f"The total number of samples seen: {sklearn_pca.n_samples_seen_}")
-        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins, curr_dt_time)
+        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins, encoder, curr_dt_time)
 
     else:
         print("Starting third iteration over CSVs - IncrementalPCA transform...")
@@ -697,6 +758,7 @@ def pca(
                 # pass the scaled data to PCA transform()
                 preprocessed_chunk = preprocess_chunk(
                     chunk_sub,
+                    encoder,
                     null_col_dict,
                     index,
                     # scale_bins=scale_bins,
@@ -741,7 +803,7 @@ def pca(
                                 f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
                             ],
                         ),
-                        path="s3://sales-demand-data/parquet_dataset/",
+                        path=f"s3://sales-demand-data/parquet_dataset_{encoder}/",
                         index=False,
                         dataset=True,
                         mode="append",
@@ -791,7 +853,7 @@ def pca(
                     ]
                     + [f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)],
                 ),
-                path="s3://sales-demand-data/parquet_dataset/",
+                path=f"s3://sales-demand-data/parquet_dataset_{encoder}/",
                 index=False,
                 dataset=True,
                 mode="append",
@@ -838,22 +900,26 @@ def pca(
 
         print("Saving StandardScaler object and IncrementalPCA object to files...")
         # save the scaler
-        with open('scaler.pkl', 'wb') as fp:
+        with open("scaler.pkl", "wb") as fp:
             pk.dump(scaler, fp)
         # save the PCA object
-        with open('pca.pkl', 'wb') as fp:
+        with open("pca.pkl", "wb") as fp:
             pk.dump(sklearn_pca, fp)
 
         try:
             key = f"scaler_{curr_dt_time}.pkl"
             response = s3_client.upload_file("scaler.pkl", "sales-demand-data", key)
         except ClientError as e:
-            logging.exception("Pickle file with dump of StandardScaler object was not copied to S3.")
+            logging.exception(
+                "Pickle file with dump of StandardScaler object was not copied to S3."
+            )
         try:
             key = f"pca_{curr_dt_time}.pkl"
             response = s3_client.upload_file("pca.pkl", "sales-demand-data", key)
         except ClientError as e:
-            logging.exception("Pickle file with dump of PCA object was not copied to S3.")
+            logging.exception(
+                "Pickle file with dump of PCA object was not copied to S3."
+            )
 
             # save transformed data array to npy file on S3
             # IS IT OKAY TO BUILD UP A LARGE COMPLETE PCA_TRANSFORMED ARRAY?
@@ -928,6 +994,12 @@ def main():
         type=valid_date,
     )
     parser.add_argument(
+        "encoder",
+        metavar="<encoder>",
+        help="whether to use dummy or ordinal encoding on categorical features",
+        choices=["dummy", "ordinal"],
+    )
+    parser.add_argument(
         "--chunksize",
         "-s",
         help="chunksize (number of rows) for read_csv(), default is 1,000",
@@ -970,7 +1042,7 @@ def main():
         log_dir = Path.cwd().joinpath("logs")
         path = Path(log_dir)
         path.mkdir(exist_ok=True)
-        curr_dt_time = datetime.datetime.now().strftime('%Y_%m_%d_%H_%M')
+        curr_dt_time = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M")
         log_fname = f"logging_{curr_dt_time}_{args.command}.log"
         log_path = log_dir.joinpath(log_fname)
 
@@ -1040,7 +1112,8 @@ def main():
             )
             logging.info(
                 f"Running PCA function with chunksize: {args.chunksize}, n_components: {args.comps}, "
-                f"first_month: {args.startmonth}, frac: {args.frac}, scale_bins: {args.scale_bins}..."
+                f"first_month: {args.startmonth}, frac: {args.frac}, scale_bins: {args.scale_bins}, "
+                f"encoder: {args.encoder}..."
             )
             pca(
                 chunksize=args.chunksize,
@@ -1048,6 +1121,7 @@ def main():
                 first_mon=first_mon,
                 frac=args.frac,
                 scale_bins=args.scale_bins,
+                encoder=args.encoder,
                 curr_dt_time=curr_dt_time,
             )
 
