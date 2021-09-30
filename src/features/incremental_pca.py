@@ -125,7 +125,7 @@ def list_csvs(bucket="my-rds-exports", prefix="shops", first_mon=""):
 # shows how to dump PCA object to pickle file
 
 
-def plot_pca_components(fit_pca, first_mon, frac, scale_bins, encoder, curr_dt_time):
+def plot_pca_components(fit_pca, first_mon, frac, scale_bins, curr_dt_time):
     """Plot cumulative explained variance of all PCs from PCA results.
 
     Parameters:
@@ -138,8 +138,6 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, encoder, curr_dt_t
         Fraction of rows that was sampled from CSVs
     scale_bins : bool
         Whether binary columns were scaled with StandardScaler prior to PCA
-    encoder : str
-        Type of encoder to apply to categorical features: dummy or ordinal
     curr_dt_time : str
         Date-time string created at start of script and to be used to insert
         consistent timestamp in filenames
@@ -175,7 +173,6 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, encoder, curr_dt_t
             f"# Samples: {fit_pca.n_samples_seen_:,}",
             f"# Components: {fit_pca.n_components_}",
             f"Binary cols scaled: {scale_bins}",
-            f"Encoding: {encoder}",
         )
     )
     ax.text(
@@ -198,7 +195,7 @@ def plot_pca_components(fit_pca, first_mon, frac, scale_bins, encoder, curr_dt_t
         logging.exception("PCA explained variance plot file was not copied to S3.")
 
 
-def preprocess_chunk(df, encoder, null_col_dict, index):
+def preprocess_chunk(df, extract_cat_cols, null_col_dict, index, iteration=None):
     """Perform necessary preprocessing steps on each chunk of CSV data prior
     to passing data to StandardScaler.
 
@@ -206,13 +203,16 @@ def preprocess_chunk(df, encoder, null_col_dict, index):
     -----------
     df : DataFrame
         Chunk of CSV data
-    encoder : str
-        Type of encoder to apply to categorical features: dummy or ordinal
+    extract_cat_cols : bool
+        keep binary and categorical features along with PCs in final
+        Parquet dataset (if True) or not (if False)
     null_col_dict : dict
         Dictionary of columns that have null values in CSVs, with their
         data types that need to be assigned after nulls are filled with 0's
     index : int
         Chunk counter
+    iteration: int
+        counter of iterations over data in pca() function
 
     Returns:
     --------
@@ -292,81 +292,44 @@ def preprocess_chunk(df, encoder, null_col_dict, index):
     months = [x for x in range(12)]
     quarters = [x for x in range(1, 5)]
 
-    if encoder == "dummy":
+    # encode categorical features as dummies
+    prefix = "i_item_cat_broad"
+    df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
+    cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
+    df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
-        # encode categorical features as dummies
-        prefix = "i_item_cat_broad"
-        df_cats = pd.get_dummies(df.i_item_category_broad, prefix=prefix)
-        cols = df_cats.columns.union([prefix + "_" + x for x in broad_cats])
-        df_cats = df_cats.reindex(cols, axis=1, fill_value=0).astype("uint8")
+    prefix = "i_item_first_mon"
+    df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
+    cols = df_first_months.columns.union(
+        [prefix + "_" + str(x) for x in mons_of_first_sale]
+    )
+    df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype(
+        "uint8"
+    )
 
-        prefix = "i_item_first_mon"
-        df_first_months = pd.get_dummies(df.i_item_mon_of_first_sale, prefix=prefix)
-        cols = df_first_months.columns.union(
-            [prefix + "_" + str(x) for x in mons_of_first_sale]
-        )
-        df_first_months = df_first_months.reindex(cols, axis=1, fill_value=0).astype(
-            "uint8"
-        )
+    prefix = "d_year"
+    df_years = pd.get_dummies(df.d_year, prefix=prefix)
+    cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
+    df_years = df_years.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
-        prefix = "d_year"
-        df_years = pd.get_dummies(df.d_year, prefix=prefix)
-        cols = df_years.columns.union([prefix + "_" + str(x) for x in years])
-        df_years = df_years.reindex(cols, axis=1, fill_value=0).astype("uint8")
+    prefix = "d_day_of_week"
+    df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
+    cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
+    df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
-        prefix = "d_day_of_week"
-        df_dow = pd.get_dummies(df.d_day_of_week, prefix=prefix)
-        cols = df_dow.columns.union([prefix + "_" + str(x) for x in dow])
-        df_dow = df_dow.reindex(cols, axis=1, fill_value=0).astype("uint8")
+    prefix = "d_month"
+    df_months = pd.get_dummies(df.d_month, prefix=prefix)
+    cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
+    df_months = df_months.reindex(cols, axis=1, fill_value=0).astype("uint8")
 
-        prefix = "d_month"
-        df_months = pd.get_dummies(df.d_month, prefix=prefix)
-        cols = df_months.columns.union([prefix + "_" + str(x) for x in months])
-        df_months = df_months.reindex(cols, axis=1, fill_value=0).astype("uint8")
+    prefix = "d_quarter"
+    df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
+    cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
+    df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype("uint8")
+    # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
 
-        prefix = "d_quarter"
-        df_quarters = pd.get_dummies(df.d_quarter_of_year, prefix=prefix)
-        cols = df_quarters.columns.union([prefix + "_" + str(x) for x in quarters])
-        df_quarters = df_quarters.reindex(cols, axis=1, fill_value=0).astype("uint8")
-        # d_week_of_year (1 to 53) - skipped for get_dummies because of high cardinality
+    if extract_cat_cols and (iteration == 3):
 
-        df = pd.concat(
-            [
-                df.drop(
-                    [
-                        "i_item_category_broad",
-                        "i_item_mon_of_first_sale",
-                        "d_year",
-                        "d_day_of_week",
-                        "d_month",
-                        "d_quarter_of_year",
-                    ],
-                    axis=1,
-                ),
-                df_cats,
-                df_first_months,
-                df_years,
-                df_dow,
-                df_months,
-                df_quarters,
-            ],
-            axis=1,
-        )
-
-    elif encoder == "ordinal":
-
-        enc = OrdinalEncoder(
-            categories=[
-                broad_cats,
-                mons_of_first_sale,
-                years,
-                dow,
-                months,
-                quarters,
-                [x for x in range(1, 54)],  # for d_week_of_year
-            ],
-            dtype="uint8",
-        )
         cat_col_names = [
             "i_item_category_broad",
             "i_item_mon_of_first_sale",
@@ -376,30 +339,44 @@ def preprocess_chunk(df, encoder, null_col_dict, index):
             "d_quarter_of_year",
             "d_week_of_year",
         ]
-        # convert category types to uint8/16
-        df['i_item_mon_of_first_sale'] = df['i_item_mon_of_first_sale'].astype('uint8')
-        df['d_year'] = df['d_year'].astype('uint16')
-        cat_cols = enc.fit_transform(df[cat_col_names])
-        cat_cols_df = pd.DataFrame(cat_cols, columns=cat_col_names, index=df.index)
-
-        df = pd.concat(
+        df_with_extra_cat_cols = pd.concat(
             [
-                df.drop(
-                    [
-                        "i_item_category_broad",
-                        "i_item_mon_of_first_sale",
-                        "d_year",
-                        "d_day_of_week",
-                        "d_month",
-                        "d_quarter_of_year",
-                        "d_week_of_year",
-                    ],
-                    axis=1,
+                ordinal_encode(
+                    df[cat_col_names].copy(),
+                    broad_cats,
+                    mons_of_first_sale,
+                    years,
+                    dow,
+                    months,
+                    quarters,
                 ),
-                cat_cols_df,
+                df.select_dtypes(include="uint8"),
             ],
             axis=1,
         )
+
+    df = pd.concat(
+        [
+            df.drop(
+                [
+                    "i_item_category_broad",
+                    "i_item_mon_of_first_sale",
+                    "d_year",
+                    "d_day_of_week",
+                    "d_month",
+                    "d_quarter_of_year",
+                ],
+                axis=1,
+            ),
+            df_cats,
+            df_first_months,
+            df_years,
+            df_dow,
+            df_months,
+            df_quarters,
+        ],
+        axis=1,
+    )
 
     # check each chunk for infinity values and stop script if any values are found
     if df[df.isin([np.inf, -np.inf])].count().any():
@@ -410,7 +387,32 @@ def preprocess_chunk(df, encoder, null_col_dict, index):
         )
         sys.exit(1)
 
+    if extract_cat_cols and (iteration == 3):
+        return df, df_with_extra_cat_cols
     return df
+
+
+def ordinal_encode(df, broad_cats, mons_of_first_sale, years, dow, months, quarters):
+
+    enc = OrdinalEncoder(
+        categories=[
+            broad_cats,
+            mons_of_first_sale,
+            years,
+            dow,
+            months,
+            quarters,
+            [x for x in range(1, 54)],  # for d_week_of_year
+        ],
+        dtype="uint8",
+    )
+    # convert category types to uint8/16
+    df["i_item_mon_of_first_sale"] = df["i_item_mon_of_first_sale"].astype("uint8")
+    df["d_year"] = df["d_year"].astype("uint16")
+    cat_cols = enc.fit_transform(df)
+    cat_cols_df = pd.DataFrame(cat_cols, columns=df.columns, index=df.index)
+
+    return cat_cols_df
 
 
 def pca(
@@ -420,7 +422,7 @@ def pca(
     first_mon="",
     frac=1.0,
     scale_bins=False,
-    encoder="",
+    extract_cat_cols=False,
     curr_dt_time="",
 ):
     """Implement StandardScaler and IncrementalPCA with partial_fit() methods.
@@ -440,8 +442,9 @@ def pca(
     scale_bins : bool
         Whether binary columns are to be scaled with StandardScaler prior to PCA
         (default: False)
-    encoder : str
-        Type of encoder to apply to categorical features: dummy or ordinal
+    extract_cat_cols : bool
+        keep binary and categorical features along with PCs in final
+        Parquet dataset (if True) or not (if False)
     curr_dt_time : str
         Date-time string created at start of script and to be used to insert
         consistent timestamp in filenames
@@ -616,9 +619,10 @@ def pca(
                         chunk.sample(frac=frac, random_state=42).sort_values(
                             by=["shop_id", "item_id", "sale_date"]
                         ),
-                        encoder,
+                        extract_cat_cols,
                         null_col_dict,
                         index,
+                        iteration=1,
                         # scale_bins=scale_bins,
                     ).select_dtypes(**select_dtypes_params)
                 )
@@ -666,9 +670,10 @@ def pca(
                 chunk.sample(frac=frac, random_state=42).sort_values(
                     by=["shop_id", "item_id", "sale_date"]
                 ),
-                encoder,
+                extract_cat_cols,
                 null_col_dict,
                 index,
+                iteration=2,
                 # scale_bins=scale_bins,
             )
             scaled_data = scaler.transform(
@@ -709,7 +714,7 @@ def pca(
             f"The estimated number of principal components: {sklearn_pca.n_components_}"
         )
         logging.info(f"The total number of samples seen: {sklearn_pca.n_samples_seen_}")
-        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins, encoder, curr_dt_time)
+        plot_pca_components(sklearn_pca, first_mon, frac, scale_bins, curr_dt_time)
 
     else:
         print("Starting third iteration over CSVs - IncrementalPCA transform...")
@@ -756,13 +761,25 @@ def pca(
                 id_cols_arr = id_cols_arr.to_numpy()
                 # after chunk is sampled (above), apply the same transformation and standard scaling
                 # pass the scaled data to PCA transform()
-                preprocessed_chunk = preprocess_chunk(
-                    chunk_sub,
-                    encoder,
-                    null_col_dict,
-                    index,
-                    # scale_bins=scale_bins,
-                )
+                if extract_cat_cols:
+                    preprocessed_chunk, df_with_extra_cat_cols = preprocess_chunk(
+                        chunk_sub,
+                        extract_cat_cols,
+                        null_col_dict,
+                        index,
+                        iteration=3,
+                        # scale_bins=scale_bins,
+                    )
+                    extra_cat_cols_arr = df_with_extra_cat_cols.to_numpy()
+                else:
+                    preprocessed_chunk = preprocess_chunk(
+                        chunk_sub,
+                        extract_cat_cols,
+                        null_col_dict,
+                        index,
+                        iteration=3,
+                        # scale_bins=scale_bins,
+                    )
                 scaled_data = scaler.transform(
                     preprocessed_chunk.select_dtypes(**select_dtypes_params)
                 )
@@ -780,49 +797,103 @@ def pca(
 
                 tx_chunk = sklearn_pca.transform(scaled_data)
                 if pca_transformed is None:
-                    pca_transformed = np.hstack((id_cols_arr, tx_chunk))
+                    if extract_cat_cols:
+                        pca_transformed = np.hstack(
+                            (id_cols_arr, extra_cat_cols_arr, tx_chunk)
+                        )
+                    else:
+                        pca_transformed = np.hstack((id_cols_arr, tx_chunk))
                     shape_list.append(pca_transformed.shape)
                 else:
-                    tx_chunk = np.hstack((id_cols_arr, tx_chunk))
+                    if extract_cat_cols:
+                        tx_chunk = np.hstack(
+                            (id_cols_arr, extra_cat_cols_arr, tx_chunk)
+                        )
+                    else:
+                        tx_chunk = np.hstack((id_cols_arr, tx_chunk))
                     shape_list.append(tx_chunk.shape)
                     pca_transformed = np.vstack((pca_transformed, tx_chunk))
+
+                if extract_cat_cols:
+                    column_names = (
+                        [
+                            "shop_id",
+                            "item_id",
+                            "sale_date",
+                            "sid_shop_item_qty_sold_day",
+                        ]
+                        + [f"cat{x}" for x in range(1, extra_cat_cols_arr.shape[1] + 1)]
+                        + [
+                            f"pc{x}"
+                            for x in range(
+                                1,
+                                pca_transformed.shape[1]
+                                - 3
+                                - extra_cat_cols_arr.shape[1],
+                            )
+                        ]
+                    )
+                    dtype_dict = {
+                        **{
+                            k: "float"
+                            for k in [
+                                f"pc{x}"
+                                for x in range(
+                                    1,
+                                    pca_transformed.shape[1]
+                                    - 3
+                                    - extra_cat_cols_arr.shape[1],
+                                )
+                            ]
+                        },
+                        **{
+                            k: "smallint"
+                            for k in [
+                                f"cat{x}"
+                                for x in range(1, extra_cat_cols_arr.shape[1] + 1)
+                            ]
+                        },
+                        **{
+                            "shop_id": "smallint",
+                            "item_id": "int",
+                            "sid_shop_item_qty_sold_day": "smallint",
+                        },
+                    }
+                    s3_path = f"s3://sales-demand-data/parquet_dataset_w_cat_cols/"
+                else:
+                    column_names = [
+                        "shop_id",
+                        "item_id",
+                        "sale_date",
+                        "sid_shop_item_qty_sold_day",
+                    ] + [f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)]
+                    dtype_dict = {
+                        **{
+                            k: "float"
+                            for k in [
+                                f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
+                            ]
+                        },
+                        **{
+                            "shop_id": "smallint",
+                            "item_id": "int",
+                            "sid_shop_item_qty_sold_day": "smallint",
+                        },
+                    }
+                    s3_path = f"s3://sales-demand-data/parquet_dataset/"
 
                 if pca_transformed.nbytes > 100_000_000:
                     # convert the array to pandas dataframe and upload it to S3
                     # as a parquet file/dataset
                     wr.s3.to_parquet(
-                        df=pd.DataFrame(
-                            pca_transformed,
-                            columns=[
-                                "shop_id",
-                                "item_id",
-                                "sale_date",
-                                "sid_shop_item_qty_sold_day",
-                            ]
-                            + [
-                                f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
-                            ],
-                        ),
-                        path=f"s3://sales-demand-data/parquet_dataset_{encoder}/",
+                        df=pd.DataFrame(pca_transformed, columns=column_names,),
+                        path=s3_path,
                         index=False,
                         dataset=True,
                         mode="append",
                         partition_cols=["sale_date"],
                         # https://docs.aws.amazon.com/athena/latest/ug/data-types.html
-                        dtype={
-                            **{
-                                k: "float"
-                                for k in [
-                                    f"pc{x}"
-                                    for x in range(1, pca_transformed.shape[1] - 3)
-                                ]
-                            },
-                            **{
-                                "shop_id": "smallint",
-                                "item_id": "int",
-                                "sid_shop_item_qty_sold_day": "smallint",
-                            },
-                        },
+                        dtype=dtype_dict,
                     )
 
                     # also update combined shape of PCA-transformed data
@@ -843,34 +914,13 @@ def pca(
             # convert the array to pandas dataframe and upload it to S3
             # as a parquet file/dataset
             wr.s3.to_parquet(
-                df=pd.DataFrame(
-                    pca_transformed,
-                    columns=[
-                        "shop_id",
-                        "item_id",
-                        "sale_date",
-                        "sid_shop_item_qty_sold_day",
-                    ]
-                    + [f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)],
-                ),
-                path=f"s3://sales-demand-data/parquet_dataset_{encoder}/",
+                df=pd.DataFrame(pca_transformed, columns=column_names,),
+                path=s3_path,
                 index=False,
                 dataset=True,
                 mode="append",
                 partition_cols=["sale_date"],
-                dtype={
-                    **{
-                        k: "float"
-                        for k in [
-                            f"pc{x}" for x in range(1, pca_transformed.shape[1] - 3)
-                        ]
-                    },
-                    **{
-                        "shop_id": "smallint",
-                        "item_id": "int",
-                        "sid_shop_item_qty_sold_day": "smallint",
-                    },
-                },
+                dtype=dtype_dict,
             )
 
             # also update combined shape of PCA-transformed data
@@ -994,12 +1044,6 @@ def main():
         type=valid_date,
     )
     parser.add_argument(
-        "encoder",
-        metavar="<encoder>",
-        help="whether to use dummy or ordinal encoding on categorical features",
-        choices=["dummy", "ordinal"],
-    )
-    parser.add_argument(
         "--chunksize",
         "-s",
         help="chunksize (number of rows) for read_csv(), default is 1,000",
@@ -1025,6 +1069,16 @@ def main():
         default=False,
         action="store_true",
         help="scale binary features (if included) or not (if not included)",
+    )
+    parser.add_argument(
+        "--keep_cats",
+        "-k",
+        default=False,
+        action="store_true",
+        help=(
+            "keep binary and categorical features along with PCs in final "
+            "Parquet dataset (if included) or not (if not included)"
+        ),
     )
 
     args = parser.parse_args()
@@ -1113,7 +1167,7 @@ def main():
             logging.info(
                 f"Running PCA function with chunksize: {args.chunksize}, n_components: {args.comps}, "
                 f"first_month: {args.startmonth}, frac: {args.frac}, scale_bins: {args.scale_bins}, "
-                f"encoder: {args.encoder}..."
+                f"keep_cats: {args.keep_cats}..."
             )
             pca(
                 chunksize=args.chunksize,
@@ -1121,7 +1175,7 @@ def main():
                 first_mon=first_mon,
                 frac=args.frac,
                 scale_bins=args.scale_bins,
-                encoder=args.encoder,
+                extract_cat_cols=args.keep_cats,
                 curr_dt_time=curr_dt_time,
             )
 
