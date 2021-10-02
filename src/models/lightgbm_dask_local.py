@@ -42,7 +42,7 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 import dask as dsk
-from dask import dataframe as dd
+from dask import array as da, dataframe as dd
 from dask.distributed import Client, LocalCluster, performance_report, wait
 from dask_ml.metrics.regression import mean_squared_error
 from dateutil.relativedelta import relativedelta
@@ -253,28 +253,29 @@ params = {
     "metric": ["rmse"],  # tweedie, poisson, rmse, l1, l2
     "boosting_type": ["gbdt"],
     # num_leaves - sets the maximum number of nodes per tree. Decrease num_leaves to reduce training time.
-    "num_leaves": [40],  # max number of leaves in one tree, 31 is default
+    "num_leaves": [28],  # max number of leaves in one tree, 31 is default
     # max_depth - this parameter is an integer that controls the maximum distance between the root node of each tree and a leaf node. Decrease max_depth to reduce training time. -1 is default (no limit)
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
     "max_depth": [5],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
-    "num_iterations": [100],
+    "num_iterations": [500],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
-    "min_child_samples": [100],
+    "min_child_samples": [200],
     # learning_rate: default is 0.1
     "learning_rate": [0.01],
     # max_bin - max number of bins that feature values will be bucketed in, use larger value for better accuracy (may be slower), smaller value helps deal with over-fitting, default is 255
-    "max_bin": [128],
+    "max_bin": [255],
     # subsample_for_bin - number of data that sampled to construct feature discrete bins, default: 200000
     "subsample_for_bin": [200000],
     # bagging_fraction - for random selection of part of the data, without resampling, default: 1.0, constraints: 0.0 < bagging_fraction <= 1.0
-    "bagging_fraction": [1.0],
+    "bagging_fraction": [0.6],
     # bagging_freq - frequency for bagging, 0 means disable bagging; k means perform bagging at every k iteration. default: 0
     "bagging_freq": [0],
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
-    "colsample_bytree": [1.0],
-    "tweedie_variance_power": [1.2],
+    "colsample_bytree": [1.],
+    "tweedie_variance_power": [1.4],
+    "weight_for_zeros": [1.],
 }
 # additional parameters
 # pre_partition: https://lightgbm.readthedocs.io/en/latest/Parameters.html#pre_partition
@@ -369,6 +370,28 @@ class LightGBMDaskLocal:
         # to allow for one set of train-validation data to be created only once?
 
         try:
+            # this commented out code did not work without the meta= argument,
+            # meta= was not tried as it needs all other columns listed, in
+            # addition to the ones being recast
+            # self.full_dataset = self.client.persist(
+            #     dd.read_parquet(
+            #         s3_path, index=False, engine="pyarrow"
+            #     )
+            #     .sample(frac=self.frac, random_state=42)
+            #     .map_partitions(
+            #         self.cast_types,
+            #         meta={
+            #             'sid_shop_item_qty_sold_day': 'i2',
+            #             **{f'cat{n}': 'i2' for n in range(1,23)}
+            #         }
+            #     )
+            #     .map_partitions(self.drop_neg_qty_sold)
+            #     .set_index(
+            #         "sale_date", sorted=False, npartitions="auto"
+            #     )
+            #     .repartition(partition_size="100MB")
+            # )
+
             # create Dask dataframe from partitioned Parquet dataset on S3 and persist it to cluster
             self.full_dataset = dd.read_parquet(
                 s3_path, index=False, engine="pyarrow"
@@ -379,6 +402,9 @@ class LightGBMDaskLocal:
             self.full_dataset["sid_shop_item_qty_sold_day"] = self.full_dataset[
                 "sid_shop_item_qty_sold_day"
             ].astype("int16")
+            for col in self.full_dataset:
+                if col.startswith("cat"):
+                    self.full_dataset[col] = self.full_dataset[col].astype("int16")
             self.full_dataset = self.full_dataset.set_index(
                 "sale_date", sorted=False, npartitions="auto"
             )
@@ -474,17 +500,35 @@ class LightGBMDaskLocal:
         # read partitioned parquet dataset with Dask:
         # https://stackoverflow.com/questions/67222212/read-partitioned-parquet-dataset-written-by-spark-using-dask-and-pyarrow-dataset
 
+    # def cast_types(self, df):
+    #     df = df.copy()
+    #     df['sale_date'] = df["sale_date"].astype(
+    #         "datetime64[ns]"
+    #     )
+    #     for col in df:
+    #         if col.startswith("cat") or (col == "sid_shop_item_qty_sold_day"):
+    #             df[col] = df[col].astype("int16")
+    #     return df
+    #
+    # def drop_neg_qty_sold(self, df):
+    #     return df[df.sid_shop_item_qty_sold_day >= 0].copy()
+
     def gridsearch_wfv(self, params):
         # self.hyperparameters = hyperparameters
         # self.rmse_results = defaultdict(list) # replace this variable by creating a key-value in
         # the self.hyper_dict dictionary with value containing list of RMSE values
         self.all_params_combs = list()
+        # determine if there is more than one combination of hyperparameters
+        # if only one combination, set get_stats_ flag to True
+        self.get_stats_ = (
+            len(params[max(params, key=lambda x: len(params[x]))]) == 1
+        )
         for params_comb_dict in (
             dict(zip(params.keys(), v)) for v in list(product(*list(params.values())))
         ):
             # for self.hyper_dict in hyperparameters:
             # self.params_combs_list.append(params_comb_dict)
-            self.params_comb_dict = params_comb_dict
+            self.params_comb_dict = params_comb_dict.copy()
             self.params_comb_dict["rmse_list_"] = list()
             self.params_comb_dict["monthly_rmse_list_"] = list()
             self.params_comb_dict["fit_times_list_"] = list()
@@ -585,7 +629,10 @@ class LightGBMDaskLocal:
             end_date = self.startmonth + relativedelta(
                 months=m + self.n_months_in_first_train_set - 1, day=31
             )
-            get_stats = m == n_val_sets - 1
+            if self.get_stats_:
+                get_stats = m == n_val_sets - 1
+            else:
+                get_stats = False
             yield (
                 self.full_dataset.loc[:end_date],
                 self.full_dataset.loc[
@@ -597,20 +644,28 @@ class LightGBMDaskLocal:
             )
             # self.train, self.test = self.time_split(self.full_dataset, self.end_date)
 
+    def get_sample_weights(self, train):
+        weights_arr = train["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True).astype('float32')
+        weights_arr = da.where(weights_arr == 0, self.params_comb_dict['weight_for_zeros'], 1.)
+        return weights_arr
+
     def fit(self, train):
         try:
             start_time = time.perf_counter()
             logging.debug(
-                f"train X dtypes are {train[[col for col in train if col.startswith('pc')]].dtypes}"
+                f"train X dtypes are {train[[col for col in train if col.startswith(('pc','cat'))]].dtypes}"
             )
             logging.debug(
                 f"train y type is {train['sid_shop_item_qty_sold_day'].dtype}"
             )
             self.model.fit(
-                train[[col for col in train if col.startswith("pc")]].to_dask_array(
+                train[[col for col in train if col.startswith(("pc","cat"))]].to_dask_array(
                     lengths=True
                 ),
                 train["sid_shop_item_qty_sold_day"].to_dask_array(lengths=True),
+                sample_weight=self.get_sample_weights(train),
+                feature_name=[col for col in train if col.startswith(("pc","cat"))],
+                categorical_feature=[col for col in train if col.startswith("cat")],
             )
             assert self.model.fitted_
             self.params_comb_dict["fit_times_list_"].append(
@@ -630,7 +685,7 @@ class LightGBMDaskLocal:
     def predict(self, test):
         try:
             self.y_pred = self.model.predict(
-                test[[col for col in test if col.startswith("pc")]]
+                test[[col for col in test if col.startswith(("pc","cat"))]]
             )
             return self
         except Exception:
@@ -686,11 +741,14 @@ class LightGBMDaskLocal:
             )
             self.best_model.fit(
                 self.full_dataset[
-                    [col for col in self.full_dataset if col.startswith("pc")]
+                    [col for col in self.full_dataset if col.startswith(("pc","cat"))]
                 ].to_dask_array(lengths=True),
                 self.full_dataset["sid_shop_item_qty_sold_day"].to_dask_array(
-                    lengths=True
+                    lengths=True,
                 ),
+                sample_weight=self.get_sample_weights(self.full_dataset),
+                feature_name=[col for col in self.full_dataset if col.startswith(("pc","cat"))],
+                categorical_feature=[col for col in self.full_dataset if col.startswith("cat")],
             )
             output_txt = str(model_path).split("/")[-1]
             booster = self.best_model.booster_.save_model(output_txt)
@@ -803,6 +861,10 @@ def main():
     # more info here: https://docs.dask.org/en/latest/debugging.html
     logging.getLogger("dask").setLevel(logging.WARNING)
     logging.getLogger("distributed").setLevel(logging.WARNING)
+
+    # also suppress s3fs messages
+    logging.getLogger("s3fs").setLevel(logging.WARNING)
+    logging.getLogger("fsspec").setLevel(logging.WARNING)
 
     # Check if code is being run on EC2 instance (vs locally)
     my_user = os.environ.get("USER")
