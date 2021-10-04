@@ -258,7 +258,7 @@ params = {
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
     "max_depth": [5],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
-    "num_iterations": [500],
+    "num_iterations": [1000],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
     "min_child_samples": [200],
     # learning_rate: default is 0.1
@@ -405,9 +405,7 @@ class LightGBMDaskLocal:
             for col in self.full_dataset:
                 if col.startswith("cat"):
                     self.full_dataset[col] = self.full_dataset[col].astype("int16")
-            self.full_dataset = self.full_dataset.set_index(
-                "sale_date", sorted=False, npartitions="auto"
-            )
+
             logging.debug(
                 f"# of rows in full dataframe before removal of negative target values: {len(self.full_dataset)}"
             )
@@ -419,8 +417,18 @@ class LightGBMDaskLocal:
             # set_index(sorted=False, npartitions='auto')
             # df = df.repartition(npartitions=df.npartitions // 100)
 
+            # self.full_dataset = self.client.persist(self.full_dataset)
+            # _ = wait([self.full_dataset])
+
             # https://docs.dask.org/en/latest/generated/dask.dataframe.DataFrame.repartition.html
-            self.full_dataset = self.full_dataset.repartition(partition_size="100MB")
+            # self.full_dataset = self.full_dataset.repartition(partition_size="100MB")
+            self.full_dataset = self.full_dataset.set_index(
+                "sale_date", sorted=False, npartitions="auto", partition_size=100_000_000,
+            )
+            # partition_size for set_index: int, optional, desired size of
+            # eaach partition in bytes (to be used with npartitions='auto')
+
+            self.full_dataset = self.cull_empty_partitions(self.full_dataset)
 
             self.full_dataset = self.client.persist(self.full_dataset)
             _ = wait([self.full_dataset])
@@ -512,6 +520,21 @@ class LightGBMDaskLocal:
     #
     # def drop_neg_qty_sold(self, df):
     #     return df[df.sid_shop_item_qty_sold_day >= 0].copy()
+
+    # function from https://stackoverflow.com/questions/47812785/remove-empty-partitions-in-dask
+    def cull_empty_partitions(self, ddf):
+        ll = list(ddf.map_partitions(len).compute())
+        ddf_delayed = ddf.to_delayed()
+        ddf_delayed_new = list()
+        pempty = None
+        for ix, n in enumerate(ll):
+            if 0 == n:
+                pempty = ddf.get_partition(ix)
+            else:
+                ddf_delayed_new.append(ddf_delayed[ix])
+        if pempty is not None:
+            ddf = dd.from_delayed(ddf_delayed_new, meta=pempty)
+        return ddf
 
     def gridsearch_wfv(self, params):
         # self.hyperparameters = hyperparameters
