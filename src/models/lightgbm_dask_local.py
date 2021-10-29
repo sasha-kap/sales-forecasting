@@ -583,7 +583,7 @@ class LightGBMDaskLocal:
             )
             self.all_params_combs.append(self.params_comb_dict)
 
-        best_params = max(self.all_params_combs, key=lambda x: x["monthly_avg_rmse_"])
+        best_params = min(self.all_params_combs, key=lambda x: x["monthly_avg_rmse_"])
         self.best_score_ = best_params["monthly_avg_rmse_"]
         # remove non-parameter key-values from self.best_params (i.e., rmse_list_ and avg_rmse_, etc.)
         self.best_params_ = {k: v for k, v in best_params.items() if k in params}
