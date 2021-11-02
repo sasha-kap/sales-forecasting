@@ -45,6 +45,7 @@ from botocore.exceptions import ClientError
 import dask as dsk
 from dask import array as da, dataframe as dd
 from dask.distributed import Client, LocalCluster, performance_report, wait
+
 # from dask_ml.metrics.regression import mean_squared_error
 from dateutil.relativedelta import relativedelta
 from ec2_metadata import ec2_metadata
@@ -77,10 +78,58 @@ def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
     )
 
 
-def calc_rmse(y_true, y_pred, get_stats):
+def calc_rmse(xs_df, y_true, y_pred, get_stats):
     if get_stats:
         pred_stats_to_csv(y_true, y_pred)
+        save_xs_and_residuals(xs_df, y_true, y_pred)
     return mean_squared_error(y_true, y_pred, squared=False)
+
+
+def save_xs_and_residuals(xs_df, y_true, y_pred, output_fname="xs_and_residuals"):
+    y_true_df = pd.DataFrame(y_true, columns=["y_true"])
+    y_pred_df = pd.DataFrame(
+        y_pred, columns=["y_pred"], index=y_true_df.index
+    )  # convert Dask array to Pandas DF
+    xs = xs_df.copy().set_index(y_true_df.index)
+    full_df = pd.concat(
+        [xs, y_true_df, y_pred_df], axis=1
+    )  # join predictors, actual target and predicted values
+    del y_true_df
+    del y_pred_df
+    del xs
+
+    full_df["raw_residual"] = full_df["y_true"] - full_df["y_pred"]
+    full_df["pearson_residual"] = full_df["raw_residual"] / np.sqrt(full_df["y_pred"])
+    full_df["deviance_residual"] = np.sqrt(
+        2
+        * (
+            full_df["y_true"] * np.log(full_df["y_true"] / full_df["y_pred"])
+            - (full_df["y_true"] - full_df["y_pred"])
+        )
+    )
+    full_df["deviance_residual"] = np.where(
+        (full_df["y_true"] - full_df["y_pred"]) < 0,
+        (-1) * full_df["deviance_residual"],
+        full_df["deviance_residual"],
+    )
+    try:
+        s3_outpath = f"s3://sales-demand-data/{output_fname}.parquet"
+        wr.s3.to_parquet(
+            df=full_df,
+            # df=pd.DataFrame(pca_transformed, columns=column_names,),
+            path=s3_outpath,
+            index=False,
+            dataset=False,
+            # mode="overwrite",
+            # partition_cols=["sale_date"],
+            # https://docs.aws.amazon.com/athena/latest/ug/data-types.html
+            # dtype=dtype_dict,
+        )
+    except Exception:
+        logging.exception(
+            "Exception occurred while saving dataframe with predictors, "
+            "true and predicted values, and residuals to Parquet file on S3."
+        )
 
 
 def pred_stats_to_csv(y_true, y_pred, output_csv="pred_value_stats.csv"):
@@ -162,7 +211,7 @@ def custom_rmse(y_true, y_pred):
     NOTE: when you do customized loss function, the default prediction value is margin
     """
     y_pred = np.exp(y_pred)
-    return 'cust_rmse', np.sqrt(np.mean((y_true - y_pred) ** 2, axis=0)), False
+    return "cust_rmse", np.sqrt(np.mean((y_true - y_pred) ** 2, axis=0)), False
 
 
 def trunc_poisson_metric(y_true, y_pred):
@@ -188,9 +237,9 @@ def trunc_poisson_metric(y_true, y_pred):
         Is eval result higher bettr, e.g., AUC is is_higher_better
     """
     return (
-        'trunc_poisson',
+        "trunc_poisson",
         np.mean(np.log(np.exp(np.exp(y_pred)) - 1) - y_true * y_pred, axis=0),
-        False
+        False,
     )
 
 
@@ -216,7 +265,7 @@ def poisson_eval_metric(y_true, y_pred):
     is_higher_better : bool
         Is eval result higher bettr, e.g., AUC is is_higher_better
     """
-    return 'poisson_metric', np.mean(np.exp(y_pred) - y_true * y_pred, axis=0), False
+    return "poisson_metric", np.mean(np.exp(y_pred) - y_true * y_pred, axis=0), False
 
 
 def valid_frac(s):
@@ -331,10 +380,10 @@ params = {
     # "metric": ["rmse"],  # tweedie, poisson, rmse, l1, l2
     "boosting_type": ["gbdt"],
     # num_leaves - sets the maximum number of nodes per tree. Decrease num_leaves to reduce training time.
-    "num_leaves": [200],  # max number of leaves in one tree, 31 is default
+    "num_leaves": [100],  # max number of leaves in one tree, 31 is default
     # max_depth - this parameter is an integer that controls the maximum distance between the root node of each tree and a leaf node. Decrease max_depth to reduce training time. -1 is default (no limit)
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
-    "max_depth": [8],
+    "max_depth": [7],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
     "num_iterations": [1000],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
@@ -351,9 +400,9 @@ params = {
     "bagging_freq": [0],
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
-    "colsample_bytree": [1.],
+    "colsample_bytree": [1.0],
     # "tweedie_variance_power": [1.4],
-    "weight_for_zeros": [1.],
+    "weight_for_zeros": [1.0],
 }
 # additional parameters
 # pre_partition: https://lightgbm.readthedocs.io/en/latest/Parameters.html#pre_partition
@@ -491,8 +540,8 @@ class LightGBMDaskLocal:
                 )
                 self.full_dataset = self.full_dataset[
                     # self.full_dataset.sid_shop_item_qty_sold_day > 0
-                    (self.full_dataset.sid_shop_item_qty_sold_day > 0) &
-                    (self.full_dataset.sid_shop_item_qty_sold_day < 6)
+                    (self.full_dataset.sid_shop_item_qty_sold_day > 0)
+                    & (self.full_dataset.sid_shop_item_qty_sold_day < 6)
                 ]
                 # call dataframe.set_index(), then repartition, then persist
                 # https://docs.dask.org/en/latest/generated/dask.dataframe.DataFrame.set_index.html
@@ -506,7 +555,9 @@ class LightGBMDaskLocal:
                 # self.full_dataset = self.full_dataset.repartition(partition_size="100MB")
                 self.full_dataset = self.full_dataset.set_index(
                     # "sale_date", sorted=False, npartitions="auto", partition_size=100_000_000,
-                    "sale_date", sorted=False, npartitions="auto",
+                    "sale_date",
+                    sorted=False,
+                    npartitions="auto",
                 )
                 # partition_size for set_index: int, optional, desired size of
                 # eaach partition in bytes (to be used with npartitions='auto')
@@ -552,11 +603,7 @@ class LightGBMDaskLocal:
         # if reading data from single Parquet file
         else:
             try:
-                self.full_dataset = (
-                    wr.s3.read_parquet(
-                        path=s3_path
-                    )
-                )
+                self.full_dataset = wr.s3.read_parquet(path=s3_path)
                 # print(f"Dataframe data types are {self.full_dataset.dtypes.to_dict}")
                 # print(f"Data type of dataframe index is {self.full_dataset.index.dtype}")
                 # self.client.restart()
@@ -688,15 +735,14 @@ class LightGBMDaskLocal:
         loss = np.log(np.exp(np.exp(y_pred)) - 1) - y_true * y_pred
         grad = (np.exp(y_pred + np.exp(y_pred))) / (np.exp(np.exp(y_pred)) - 1) - y_true
         hess = (
-            (np.exp(y_pred + np.exp(y_pred)) * (np.exp(np.exp(y_pred)) - np.exp(y_pred) - 1)) /
-            (np.exp(np.exp(y_pred)) - 1)**2
-        )
+            np.exp(y_pred + np.exp(y_pred))
+            * (np.exp(np.exp(y_pred)) - np.exp(y_pred) - 1)
+        ) / (np.exp(np.exp(y_pred)) - 1) ** 2
 
         return grad, hess
 
     # based on https://stackoverflow.com/questions/61426195/how-to-implement-a-negative-binomial-loss-function-in-python-to-use-in-light-gbm
     def trunc_poisson_loss_scipy(self, y_true, y_pred):
-
         def loss(x, t):
             loss = np.log(np.exp(np.exp(x)) - 1) - t * x
             return loss
@@ -751,7 +797,13 @@ class LightGBMDaskLocal:
         p = 0.5
 
         def loss(x, t):
-            loss = gamma(x) + gamma(t+1) - gamma(x+t) - x*np.log(p) - t*np.log(1-p)
+            loss = (
+                gamma(x)
+                + gamma(t + 1)
+                - gamma(x + t)
+                - x * np.log(p)
+                - t * np.log(1 - p)
+            )
             return loss
 
         partial_d = lambda x: loss(x, y_true)
@@ -768,11 +820,13 @@ class LightGBMDaskLocal:
         self.all_params_combs = list()
         # determine if there is more than one combination of hyperparameters
         # if only one combination, set get_stats_ flag to True
-        self.get_stats_ = (
-            len(params[max(params, key=lambda x: len(params[x]))]) == 1
-        )
+        self.get_stats_ = len(params[max(params, key=lambda x: len(params[x]))]) == 1
         for params_comb_counter, params_comb_dict in enumerate(
-            (dict(zip(params.keys(), v)) for v in list(product(*list(params.values())))), 1
+            (
+                dict(zip(params.keys(), v))
+                for v in list(product(*list(params.values())))
+            ),
+            1,
         ):
             # for self.hyper_dict in hyperparameters:
             # self.params_combs_list.append(params_comb_dict)
@@ -785,7 +839,7 @@ class LightGBMDaskLocal:
                 self.model = lgb.LGBMRegressor(
                     # client=self.client,
                     # objective=self.truncated_poisson,
-                    objective='poisson',
+                    objective="poisson",
                     # objective=self.poisson_loss,
                     # objective=self.nb_loss,
                     # objective=self.trunc_poisson_loss_scipy,
@@ -805,8 +859,12 @@ class LightGBMDaskLocal:
             # call method that loops over train-validation sets
             # with performance_report(filename=f"dask_report_{self.curr_dt_time}.html"):
             for train, test, get_stats, train_counter in self.train_test_time_split():
-                combined_counter = "_" + "_".join([str(params_comb_counter).zfill(2), str(train_counter).zfill(2)])
-                self.fit(train, test, combined_counter).predict(test).rmse_all_folds(test, get_stats)
+                combined_counter = "_" + "_".join(
+                    [str(params_comb_counter).zfill(2), str(train_counter).zfill(2)]
+                )
+                self.fit(train, test, combined_counter, get_stats).predict(
+                    test
+                ).rmse_all_folds(test, get_stats)
 
             self.params_comb_dict["avg_rmse_"] = mean(
                 self.params_comb_dict["rmse_list_"]
@@ -903,11 +961,13 @@ class LightGBMDaskLocal:
             # self.train, self.test = self.time_split(self.full_dataset, self.end_date)
 
     def get_sample_weights(self, train):
-        weights_arr = train["sid_shop_item_qty_sold_day"].to_numpy().astype('float32')
-        weights_arr = np.where(weights_arr == 0, self.params_comb_dict['weight_for_zeros'], 1.)
+        weights_arr = train["sid_shop_item_qty_sold_day"].to_numpy().astype("float32")
+        weights_arr = np.where(
+            weights_arr == 0, self.params_comb_dict["weight_for_zeros"], 1.0
+        )
         return weights_arr
 
-    def fit(self, train, test, combined_counter):
+    def fit(self, train, test, combined_counter, get_stats):
         try:
             start_time = time.perf_counter()
             logging.debug(
@@ -917,27 +977,33 @@ class LightGBMDaskLocal:
                 f"train y type is {train['sid_shop_item_qty_sold_day'].dtype}"
             )
             self.model.fit(
-                train[[col for col in train if col.startswith(("pc","cat"))]].to_numpy(),
+                train[
+                    [col for col in train if col.startswith(("pc", "cat"))]
+                ].to_numpy(),
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 # init_score=np.repeat([np.log(np.mean(train["sid_shop_item_qty_sold_day"]))], len(train["sid_shop_item_qty_sold_day"])),
                 sample_weight=self.get_sample_weights(train),
-                feature_name=[col for col in train if col.startswith(("pc","cat"))],
+                feature_name=[col for col in train if col.startswith(("pc", "cat"))],
                 categorical_feature=[col for col in train if col.startswith("cat")],
                 eval_set=[
                     (
-                        test[[col for col in test if col.startswith(("pc","cat"))]].to_numpy(),
+                        test[
+                            [col for col in test if col.startswith(("pc", "cat"))]
+                        ].to_numpy(),
                         test["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                     (
-                        train[[col for col in train if col.startswith(("pc","cat"))]].to_numpy(),
+                        train[
+                            [col for col in train if col.startswith(("pc", "cat"))]
+                        ].to_numpy(),
                         train["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                 ],
-            	# eval_metric=custom_rmse,
+                # eval_metric=custom_rmse,
                 # eval_metric=['rmse','poisson', trunc_poisson_metric, custom_rmse, poisson_eval_metric],
-                eval_metric=['rmse','poisson'],
+                eval_metric=["rmse", "poisson"],
                 # eval_metric=[trunc_poisson_metric, 'rmse'],
-            	eval_names=['Validation', 'Train'],
+                eval_names=["Validation", "Train"],
                 # first_metric_only=True,
             )
             assert self.model.fitted_
@@ -954,27 +1020,45 @@ class LightGBMDaskLocal:
             # png_fname = combined_counter + "_rmse.png"
             # plt.savefig(png_fname)
 
-            self.params_comb_dict["counter_"].append(
-                combined_counter
-            )
+            self.params_comb_dict["counter_"].append(combined_counter)
 
-            s3_client = boto3.client("s3")
-            # for m in ('poisson', 'rmse', 'trunc_poisson', 'cust_rmse', 'poisson_metric'):
-            for m in ('poisson', 'rmse'):
-            # for m in ('trunc_poisson', 'rmse'):
-            # for m in ('cust_rmse',):
-                try:
-                    ax = lgb.plot_metric(self.model, metric=m, figsize=(8,6))
-                    png_fname = combined_counter + f"_{m}.png"
-                    plt.savefig(png_fname)
+            if get_stats:
 
-                    key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
-                    response = s3_client.upload_file(png_fname, "sales-demand-data", key)
-                except ClientError as e:
-                    logging.exception(
-                        f"PNG file with learning curve for {combined_counter} parameter-fold combination "
-                        f"and {m} metric was not copied to S3."
-                    )
+                s3_client = boto3.client("s3")
+                # for m in ('poisson', 'rmse', 'trunc_poisson', 'cust_rmse', 'poisson_metric'):
+                for m in ("poisson", "rmse"):
+                    # for m in ('trunc_poisson', 'rmse'):
+                    # for m in ('cust_rmse',):
+                    try:
+                        ax = lgb.plot_metric(self.model, metric=m, figsize=(8, 6))
+                        png_fname = combined_counter + f"_{m}.png"
+                        plt.savefig(png_fname)
+
+                        key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
+                        response = s3_client.upload_file(
+                            png_fname, "sales-demand-data", key
+                        )
+                    except ClientError as e:
+                        logging.exception(
+                            f"PNG file with learning curve for {combined_counter} parameter-fold combination "
+                            f"and {m} metric was not copied to S3."
+                        )
+
+                for t in ('split', 'gain'):
+                    try:
+                        ax = lgb.plot_importance(self.model, max_num_features=25, importance_type=t, figsize=(10, 8))
+                        png_fname = combined_counter + f"_importance_plot_{t}.png"
+                        plt.savefig(png_fname)
+
+                        key = f"{combined_counter}_{self.curr_dt_time}_importance_plot_{t}.png"
+                        response = s3_client.upload_file(
+                            png_fname, "sales-demand-data", key
+                        )
+                    except ClientError as e:
+                        logging.exception(
+                            f"PNG file with importance plot for {combined_counter} parameter-fold combination "
+                            f"and {t} importance type was not copied to S3."
+                        )
 
             return self
 
@@ -989,10 +1073,8 @@ class LightGBMDaskLocal:
     def predict(self, test):
         try:
             # self.y_pred = np.exp(
-            self.y_pred = (
-                self.model.predict(
-                    test[[col for col in test if col.startswith(("pc","cat"))]]
-                )
+            self.y_pred = self.model.predict(
+                test[[col for col in test if col.startswith(("pc", "cat"))]]
             )
             return self
         except Exception:
@@ -1011,6 +1093,7 @@ class LightGBMDaskLocal:
             # logging.debug(f"Shape of self.y_pred is: {self.y_pred.compute().shape}")
             self.params_comb_dict["rmse_list_"].append(
                 calc_rmse(
+                    test[[col for col in test if col.startswith(("pc", "cat"))]],
                     test["sid_shop_item_qty_sold_day"].to_numpy(),
                     self.y_pred,
                     get_stats,
@@ -1041,7 +1124,7 @@ class LightGBMDaskLocal:
             self.best_model = lgb.LGBMRegressor(
                 # client=self.client,
                 # objective=self.truncated_poisson,
-                objective='poisson',
+                objective="poisson",
                 random_state=42,
                 silent=False,
                 # tree_learner="data",
@@ -1050,12 +1133,16 @@ class LightGBMDaskLocal:
             )
             self.best_model.fit(
                 self.full_dataset[
-                    [col for col in self.full_dataset if col.startswith(("pc","cat"))]
+                    [col for col in self.full_dataset if col.startswith(("pc", "cat"))]
                 ].to_numpy(),
                 self.full_dataset["sid_shop_item_qty_sold_day"].to_numpy(),
                 sample_weight=self.get_sample_weights(self.full_dataset),
-                feature_name=[col for col in self.full_dataset if col.startswith(("pc","cat"))],
-                categorical_feature=[col for col in self.full_dataset if col.startswith("cat")],
+                feature_name=[
+                    col for col in self.full_dataset if col.startswith(("pc", "cat"))
+                ],
+                categorical_feature=[
+                    col for col in self.full_dataset if col.startswith("cat")
+                ],
             )
             output_txt = str(model_path).split("/")[-1]
             booster = self.best_model.booster_.save_model(output_txt)
