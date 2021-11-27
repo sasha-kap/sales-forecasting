@@ -55,7 +55,9 @@ import numpy as np
 import pandas as pd
 from scipy.misc import derivative
 from scipy.special import gamma
+from sklearn.compose import ColumnTransformer
 from sklearn.metrics import mean_squared_error
+from sklearn.preprocessing import PowerTransformer, QuantileTransformer
 
 
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
@@ -380,10 +382,10 @@ params = {
     # "metric": ["rmse"],  # tweedie, poisson, rmse, l1, l2
     "boosting_type": ["gbdt"],
     # num_leaves - sets the maximum number of nodes per tree. Decrease num_leaves to reduce training time.
-    "num_leaves": [30, 60, 100],  # max number of leaves in one tree, 31 is default
+    "num_leaves": [100],  # max number of leaves in one tree, 31 is default
     # max_depth - this parameter is an integer that controls the maximum distance between the root node of each tree and a leaf node. Decrease max_depth to reduce training time. -1 is default (no limit)
     # To keep in mind: "Accuracy may be bad since you didn't explicitly set num_leaves OR 2^max_depth > num_leaves. (num_leaves=31)."
-    "max_depth": [5, 6, 7],
+    "max_depth": [7],
     # num_iterations - number of boosting iterations, default is 100 (alias: n_estimators)
     "num_iterations": [1000],
     # min_child_samples - minimal number of data in one leaf. Can be used to deal with over-fitting, 20 is default, aka min_data_in_leaf
@@ -391,7 +393,7 @@ params = {
     # learning_rate: default is 0.1
     "learning_rate": [0.01],
     # max_bin - max number of bins that feature values will be bucketed in, use larger value for better accuracy (may be slower), smaller value helps deal with over-fitting, default is 255
-    "max_bin": [128, 255],
+    "max_bin": [128],
     # subsample_for_bin - number of data that sampled to construct feature discrete bins, default: 200000
     # "subsample_for_bin": [200000],
     # bagging_fraction - for random selection of part of the data, without resampling, default: 1.0, constraints: 0.0 < bagging_fraction <= 1.0
@@ -476,12 +478,14 @@ class LightGBMDaskLocal:
         n_months_in_first_train_set,
         n_months_in_val_set,
         frac=None,
+        normalize_tx=False,
     ):
         self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
         self.n_months_in_first_train_set = n_months_in_first_train_set
         self.n_months_in_val_set = n_months_in_val_set
         self.frac = frac if frac is not None else 1.0
+        self.normalize_tx = normalize_tx
 
         cluster = LocalCluster(n_workers=n_workers)
         self.client = Client(cluster)
@@ -890,9 +894,7 @@ class LightGBMDaskLocal:
                 combined_counter = "_" + "_".join(
                     [str(params_comb_counter).zfill(2), str(train_counter).zfill(2)]
                 )
-                self.fit(train, test, combined_counter, get_stats).predict(
-                    test
-                ).rmse_all_folds(test, get_stats)
+                self.fit(train, test, combined_counter, get_stats).predict().rmse_all_folds(test, get_stats)
 
             self.params_comb_dict["avg_rmse_"] = mean(
                 self.params_comb_dict["rmse_list_"]
@@ -952,6 +954,26 @@ class LightGBMDaskLocal:
     #         # less than or equal to last day of month currently used for validation
     #     )
 
+
+    def normalize(self, train_X, test_X):
+        # pt = PowerTransformer(standardize=True)
+        # pt_fit = pt.fit(train_X)
+        rng = np.random.RandomState(304)
+        pt = QuantileTransformer(output_distribution='normal', random_state=rng)
+
+        ct = ColumnTransformer(
+            [
+                ("qt_normal", pt, [col for col in train_X if not col.startswith("cat")]),
+            ],
+            remainder='passthrough',
+        )
+
+        ct_fit = ct.fit(train_X)
+        self.train_X = pd.DataFrame(ct_fit.transform(train_X), columns=train_X.columns)
+        self.test_X = pd.DataFrame(ct_fit.transform(test_X), columns=test_X.columns)
+
+        return self
+
     def train_test_time_split(self):
         # first (earliest) month: July 2015
         # number of months in first train set: 1
@@ -1003,37 +1025,43 @@ class LightGBMDaskLocal:
     def fit(self, train, test, combined_counter, get_stats):
         try:
             start_time = time.perf_counter()
+            non_x_cols = ("shop_id", "item_id", "sid_shop_item_qty_sold_day")
             logging.debug(
-                f"train X dtypes are {train[[col for col in train if col not in ('shop_id', 'item_id', 'sid_shop_item_qty_sold_day')]].dtypes}"
+                f"train X dtypes are {train[[col for col in train if col not in non_x_cols]].dtypes}"
                 # f"train X dtypes are {train[[col for col in train if col.startswith(('pc', 'cat'))]].dtypes}"
             )
             logging.debug(
                 f"train y type is {train['sid_shop_item_qty_sold_day'].dtype}"
             )
+
+            if self.normalize_tx:
+                self.normalize(
+                    train[[col for col in train if col not in non_x_cols]],
+                    test[[col for col in test if col not in non_x_cols]]
+                )
+            else:
+                self.train_X = train[
+                    [col for col in train if col not in non_x_cols]
+                ]
+                self.test_X = test[
+                    [col for col in test if col not in non_x_cols]
+                ]
+
             self.model.fit(
-                train[
-                    [col for col in train if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")]
-                    # [col for col in train if col.startswith(("pc", "cat"))]
-                ].to_numpy(),
+                self.train_X.to_numpy(),
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 # init_score=np.repeat([np.log(np.mean(train["sid_shop_item_qty_sold_day"]))], len(train["sid_shop_item_qty_sold_day"])),
                 sample_weight=self.get_sample_weights(train),
-                feature_name=[col for col in train if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")],
+                feature_name=[col for col in train if col not in non_x_cols],
                 # feature_name=[col for col in train if col.startswith(("pc", "cat"))],
                 categorical_feature=[col for col in train if col.startswith("cat")],
                 eval_set=[
                     (
-                        test[
-                            [col for col in test if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")]
-                            # [col for col in test if col.startswith(("pc", "cat"))]
-                        ].to_numpy(),
+                        self.test_X.to_numpy(),
                         test["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                     (
-                        train[
-                            [col for col in train if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")]
-                            # [col for col in train if col.startswith(("pc", "cat"))]
-                        ].to_numpy(),
+                        self.train_X.to_numpy(),
                         train["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                 ],
@@ -1085,6 +1113,7 @@ class LightGBMDaskLocal:
                 for t in ('split', 'gain'):
                     try:
                         ax = lgb.plot_importance(self.model, max_num_features=25, importance_type=t, figsize=(10, 8))
+                        plt.tight_layout() # per https://stackoverflow.com/questions/57311605/label-cannot-be-fully-displayed-in-bar-chart
                         png_fname = combined_counter + f"_importance_plot_{t}.png"
                         plt.savefig(png_fname)
 
@@ -1108,11 +1137,11 @@ class LightGBMDaskLocal:
             self.client.restart()
             sys.exit(1)
 
-    def predict(self, test):
+    def predict(self):
         try:
             # self.y_pred = np.exp(
             self.y_pred = self.model.predict(
-                test[[col for col in test if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")]]
+                self.test_X
                 # test[[col for col in test if col.startswith(("pc", "cat"))]]
             )
             return self
@@ -1132,7 +1161,7 @@ class LightGBMDaskLocal:
             # logging.debug(f"Shape of self.y_pred is: {self.y_pred.compute().shape}")
             self.params_comb_dict["rmse_list_"].append(
                 calc_rmse(
-                    test[[col for col in test if col not in ("shop_id", "item_id", "sid_shop_item_qty_sold_day")]],
+                    self.test_X,
                     # test[[col for col in test if col.startswith(("pc", "cat"))]],
                     test["sid_shop_item_qty_sold_day"].to_numpy(),
                     self.y_pred,
@@ -1248,6 +1277,14 @@ def main():
         type=valid_frac,
     )
 
+    parser.add_argument(
+        "--normalize_tx",
+        "-n",
+        default=False,
+        action="store_true",
+        help="apply normalization transformation to all features (if included), or not (if not included)",
+    )
+
     args = parser.parse_args()
 
     if month_counter(args.startmonth) - args.n_months_in_first_train_set + 1 <= 0:
@@ -1332,7 +1369,8 @@ def main():
     logging.info(
         f"Running LightGBM model with n_workers: {args.n_workers}, s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
-        f"n_months_in_val_set: {args.n_months_in_val_set}, and frac: {args.frac}..."
+        f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, and "
+        f"normalize_tx: {args.normalize_tx}..."
     )
 
     model = LightGBMDaskLocal(
@@ -1343,6 +1381,7 @@ def main():
         args.n_months_in_first_train_set,
         args.n_months_in_val_set,
         frac=args.frac,
+        normalize_tx=args.normalize_tx,
     )
     model.gridsearch_wfv(params)
     # model.refit_and_save(model_path)
