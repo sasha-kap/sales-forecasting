@@ -56,8 +56,9 @@ import pandas as pd
 from scipy.misc import derivative
 from scipy.special import gamma
 from sklearn.compose import ColumnTransformer
+from sklearn.decomposition import PCA
 from sklearn.metrics import mean_squared_error
-from sklearn.preprocessing import PowerTransformer, QuantileTransformer
+from sklearn.preprocessing import PowerTransformer, QuantileTransformer, StandardScaler
 
 
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
@@ -378,7 +379,7 @@ def valid_date(s):
 #     'colsample_bytree' : [1.0]
 # }
 params = {
-    # "objective": ["tweedie"],
+    "objective": ["tweedie"],
     # "metric": ["rmse"],  # tweedie, poisson, rmse, l1, l2
     "boosting_type": ["gbdt"],
     # num_leaves - sets the maximum number of nodes per tree. Decrease num_leaves to reduce training time.
@@ -403,7 +404,7 @@ params = {
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
     "colsample_bytree": [1.0],
-    # "tweedie_variance_power": [1.4],
+    "tweedie_variance_power": [1.1, 1.2, 1.4],
     "weight_for_zeros": [1.0],
 }
 # additional parameters
@@ -479,6 +480,7 @@ class LightGBMDaskLocal:
         n_months_in_val_set,
         frac=None,
         normalize_tx=False,
+        add_princomps=0,
     ):
         self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
@@ -486,6 +488,7 @@ class LightGBMDaskLocal:
         self.n_months_in_val_set = n_months_in_val_set
         self.frac = frac if frac is not None else 1.0
         self.normalize_tx = normalize_tx
+        self.add_princomps = add_princomps
 
         cluster = LocalCluster(n_workers=n_workers)
         self.client = Client(cluster)
@@ -871,7 +874,7 @@ class LightGBMDaskLocal:
                 self.model = lgb.LGBMRegressor(
                     # client=self.client,
                     # objective=self.truncated_poisson,
-                    objective="poisson",
+                    # objective="poisson",
                     # objective=self.poisson_loss,
                     # objective=self.nb_loss,
                     # objective=self.trunc_poisson_loss_scipy,
@@ -974,6 +977,22 @@ class LightGBMDaskLocal:
 
         return self
 
+    def get_pc_cols(self, train_X, test_X, n_components):
+        scaler = StandardScaler()
+        pca = PCA(n_components=n_components)
+
+        scaled_train_X = scaler.fit_transform(train_X)
+        pca_transformed_train_X = pca.fit_transform(scaled_train_X)
+        del scaled_train_X
+        pca_transformed_train_X = np.log(np.abs(pca_transformed_train_X))
+
+        scaled_test_X = scaler.transform(test_X)
+        pca_transformed_test_X = pca.transform(scaled_test_X)
+        del scaled_test_X
+        pca_transformed_test_X = np.log(np.abs(pca_transformed_test_X))
+
+        return pca_transformed_train_X, pca_transformed_test_X
+
     def train_test_time_split(self):
         # first (earliest) month: July 2015
         # number of months in first train set: 1
@@ -1024,7 +1043,6 @@ class LightGBMDaskLocal:
 
     def fit(self, train, test, combined_counter, get_stats):
         try:
-            start_time = time.perf_counter()
             non_x_cols = ("shop_id", "item_id", "sid_shop_item_qty_sold_day")
             logging.debug(
                 f"train X dtypes are {train[[col for col in train if col not in non_x_cols]].dtypes}"
@@ -1042,17 +1060,28 @@ class LightGBMDaskLocal:
             else:
                 self.train_X = train[
                     [col for col in train if col not in non_x_cols]
-                ]
+                ].reset_index(drop=True)
                 self.test_X = test[
                     [col for col in test if col not in non_x_cols]
-                ]
+                ].reset_index(drop=True)
 
+            if self.add_princomps > 0: # create additional principal component columns
+                train_pcs, test_pcs = self.get_pc_cols(train[[col for col in train if (col not in non_x_cols) and (not col.startswith("cat"))]], test[[col for col in test if (col not in non_x_cols) and (not col.startswith("cat"))]], self.add_princomps)
+                # if normalize_tx, pc step needs to be done on cols in train and test,
+                # not train_X, test_X
+                # PCA-transformed columns should just be concatenated to self.train_X
+                # and self.test_X
+                self.train_X = pd.concat([self.train_X, pd.DataFrame(train_pcs, columns=[f"pc_{c}" for c in range(self.add_princomps)])], axis=1)
+                self.test_X = pd.concat([self.test_X, pd.DataFrame(test_pcs, columns=[f"pc_{c}" for c in range(self.add_princomps)])], axis=1)
+                del train_pcs, test_pcs
+
+            start_time = time.perf_counter()
             self.model.fit(
                 self.train_X.to_numpy(),
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 # init_score=np.repeat([np.log(np.mean(train["sid_shop_item_qty_sold_day"]))], len(train["sid_shop_item_qty_sold_day"])),
                 sample_weight=self.get_sample_weights(train),
-                feature_name=[col for col in train if col not in non_x_cols],
+                feature_name=[col for col in train if col not in non_x_cols] + [f"pc_{c}" for c in range(self.add_princomps)],
                 # feature_name=[col for col in train if col.startswith(("pc", "cat"))],
                 categorical_feature=[col for col in train if col.startswith("cat")],
                 eval_set=[
@@ -1285,6 +1314,14 @@ def main():
         help="apply normalization transformation to all features (if included), or not (if not included)",
     )
 
+    parser.add_argument(
+        "--add_princomps",
+        "-p",
+        help="create specified number of additional principal component features (if included), or not (if not included)",
+        default="0",
+        type=int,
+    )
+
     args = parser.parse_args()
 
     if month_counter(args.startmonth) - args.n_months_in_first_train_set + 1 <= 0:
@@ -1369,8 +1406,8 @@ def main():
     logging.info(
         f"Running LightGBM model with n_workers: {args.n_workers}, s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
-        f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, and "
-        f"normalize_tx: {args.normalize_tx}..."
+        f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
+        f"normalize_tx: {args.normalize_tx}, and add_princomps: {args.add_princomps}..."
     )
 
     model = LightGBMDaskLocal(
@@ -1382,6 +1419,7 @@ def main():
         args.n_months_in_val_set,
         frac=args.frac,
         normalize_tx=args.normalize_tx,
+        add_princomps=args.add_princomps,
     )
     model.gridsearch_wfv(params)
     # model.refit_and_save(model_path)
