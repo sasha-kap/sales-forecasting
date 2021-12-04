@@ -404,7 +404,7 @@ params = {
     # feature_fraction - LightGBM will randomly select a subset of features on each iteration (tree) if feature_fraction is smaller than 1.0, default: 1.0, constraints: 0.0 < feature_fraction <= 1.0
     # colsample_bytree (float, optional (default=1.)) – Subsample ratio of columns when constructing each tree.
     "colsample_bytree": [1.0],
-    "tweedie_variance_power": [1.1, 1.2, 1.4],
+    "tweedie_variance_power": [1.2],
     "weight_for_zeros": [1.0],
 }
 # additional parameters
@@ -481,6 +481,7 @@ class LightGBMDaskLocal:
         frac=None,
         normalize_tx=False,
         add_princomps=0,
+        add_interactions=False,
     ):
         self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
@@ -489,6 +490,7 @@ class LightGBMDaskLocal:
         self.frac = frac if frac is not None else 1.0
         self.normalize_tx = normalize_tx
         self.add_princomps = add_princomps
+        self.add_interactions = add_interactions
 
         cluster = LocalCluster(n_workers=n_workers)
         self.client = Client(cluster)
@@ -984,12 +986,15 @@ class LightGBMDaskLocal:
         scaled_train_X = scaler.fit_transform(train_X)
         pca_transformed_train_X = pca.fit_transform(scaled_train_X)
         del scaled_train_X
-        pca_transformed_train_X = np.log(np.abs(pca_transformed_train_X))
+        # pca_transformed_train_X = np.log(np.abs(pca_transformed_train_X))
 
         scaled_test_X = scaler.transform(test_X)
         pca_transformed_test_X = pca.transform(scaled_test_X)
         del scaled_test_X
-        pca_transformed_test_X = np.log(np.abs(pca_transformed_test_X))
+        # pca_transformed_test_X = np.log(np.abs(pca_transformed_test_X))
+
+        pca_transformed_train_X = pd.DataFrame(pca_transformed_train_X, columns=[f"pc_{c}" for c in range(n_components)])
+        pca_transformed_test_X = pd.DataFrame(pca_transformed_test_X, columns=[f"pc_{c}" for c in range(n_components)])
 
         return pca_transformed_train_X, pca_transformed_test_X
 
@@ -1065,32 +1070,69 @@ class LightGBMDaskLocal:
                     [col for col in test if col not in non_x_cols]
                 ].reset_index(drop=True)
 
+            train_pcs_df = None
+            test_pcs_df = None
             if self.add_princomps > 0: # create additional principal component columns
-                train_pcs, test_pcs = self.get_pc_cols(train[[col for col in train if (col not in non_x_cols) and (not col.startswith("cat"))]], test[[col for col in test if (col not in non_x_cols) and (not col.startswith("cat"))]], self.add_princomps)
+                train_pcs_df, test_pcs_df = self.get_pc_cols(train[[col for col in train if (col not in non_x_cols) and (not col.startswith("cat"))]], test[[col for col in test if (col not in non_x_cols) and (not col.startswith("cat"))]], self.add_princomps)
                 # if normalize_tx, pc step needs to be done on cols in train and test,
                 # not train_X, test_X
                 # PCA-transformed columns should just be concatenated to self.train_X
                 # and self.test_X
-                self.train_X = pd.concat([self.train_X, pd.DataFrame(train_pcs, columns=[f"pc_{c}" for c in range(self.add_princomps)])], axis=1)
-                self.test_X = pd.concat([self.test_X, pd.DataFrame(test_pcs, columns=[f"pc_{c}" for c in range(self.add_princomps)])], axis=1)
-                del train_pcs, test_pcs
+
+            train_interaction_df_list = list()
+            test_interaction_df_list = list()
+            if self.add_interactions:
+                for col in [
+                    "d_days_after_holiday",
+                    "d_days_to_holiday",
+                    "d_eurrub",
+                    "d_usdrub",
+                ]:
+                    train_interaction_df_list.append(
+                        self.train_X[[cl for cl in self.train_X if "_7d" in cl]]
+                        .multiply(self.train_X[col], axis=0)
+                        .rename(
+                            columns={
+                                k: f"{k}_{col}" for k in [
+                                    cl for cl in self.train_X if "_7d" in cl
+                                ]
+                            }
+                        )
+                    )
+                    test_interaction_df_list.append(
+                        self.test_X[[cl for cl in self.test_X if "_7d" in cl]]
+                        .multiply(self.test_X[col], axis=0)
+                        .rename(
+                            columns={
+                                k: f"{k}_{col}" for k in [
+                                    cl for cl in self.test_X if "_7d" in cl
+                                ]
+                            }
+                        )
+                    )
+
+            if self.add_princomps > 0 or self.add_interactions:
+                self.train_X = pd.concat([self.train_X, train_pcs_df, *train_interaction_df_list], axis=1)
+                self.test_X = pd.concat([self.test_X, test_pcs_df, *test_interaction_df_list], axis=1)
+                del train_pcs_df, test_pcs_df, train_interaction_df_list, test_interaction_df_list
+            print(self.train_X.columns.to_list())
 
             start_time = time.perf_counter()
             self.model.fit(
-                self.train_X.to_numpy(),
+                self.train_X,
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 # init_score=np.repeat([np.log(np.mean(train["sid_shop_item_qty_sold_day"]))], len(train["sid_shop_item_qty_sold_day"])),
                 sample_weight=self.get_sample_weights(train),
-                feature_name=[col for col in train if col not in non_x_cols] + [f"pc_{c}" for c in range(self.add_princomps)],
+                # feature_name=[col for col in train if col not in non_x_cols] + [f"pc_{c}" for c in range(self.add_princomps)],
                 # feature_name=[col for col in train if col.startswith(("pc", "cat"))],
-                categorical_feature=[col for col in train if col.startswith("cat")],
+                categorical_feature=[col for col in self.train_X if col.startswith("cat")],
                 eval_set=[
                     (
-                        self.test_X.to_numpy(),
+                        self.test_X,
                         test["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                     (
-                        self.train_X.to_numpy(),
+                        self.train_X,
                         train["sid_shop_item_qty_sold_day"].to_numpy(),
                     ),
                 ],
@@ -1322,6 +1364,14 @@ def main():
         type=int,
     )
 
+    parser.add_argument(
+        "--add_interactions",
+        "-t",
+        help="create interaction features (if included) or not (if not included)",
+        default=False,
+        action="store_true",
+    )
+
     args = parser.parse_args()
 
     if month_counter(args.startmonth) - args.n_months_in_first_train_set + 1 <= 0:
@@ -1407,7 +1457,8 @@ def main():
         f"Running LightGBM model with n_workers: {args.n_workers}, s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
         f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
-        f"normalize_tx: {args.normalize_tx}, and add_princomps: {args.add_princomps}..."
+        f"normalize_tx: {args.normalize_tx}, add_princomps: {args.add_princomps}, "
+        f"and add_interactions: {args.add_interactions}..."
     )
 
     model = LightGBMDaskLocal(
@@ -1420,6 +1471,7 @@ def main():
         frac=args.frac,
         normalize_tx=args.normalize_tx,
         add_princomps=args.add_princomps,
+        add_interactions=args.add_interactions,
     )
     model.gridsearch_wfv(params)
     # model.refit_and_save(model_path)
