@@ -64,7 +64,13 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from tensorflow import keras
-from tensorflow.keras import initializers, layers, metrics, optimizers
+from tensorflow.keras import (
+    callbacks,
+    initializers,
+    layers,
+    metrics,
+    optimizers
+)
 
 
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
@@ -487,6 +493,7 @@ class KerasPoisson:
         frac=None,
         # normalize_tx=False,
         scaler="s",
+        effect_coding=False,
         add_princomps=0,
         add_interactions=False,
     ):
@@ -498,6 +505,7 @@ class KerasPoisson:
         self.frac = frac if frac is not None else 1.0
         # self.normalize_tx = normalize_tx
         self.scaler = scaler
+        self.effect_coding = effect_coding
         self.add_princomps = add_princomps
         self.add_interactions = add_interactions
         self.non_x_cols = ("shop_id", "item_id", "sid_shop_item_qty_sold_day")
@@ -1083,6 +1091,15 @@ class KerasPoisson:
             .tolist(),
             dtype="float32",
         )
+        if self.effect_coding:
+            self.train_X[[col for col in self.train_X if col.startswith("cat")]] = (
+                self.train_X[[col for col in self.train_X if col.startswith("cat")]]
+                .replace(0., -1.)
+            )
+            self.test_X[[col for col in self.test_X if col.startswith("cat")]] = (
+                self.test_X[[col for col in self.test_X if col.startswith("cat")]]
+                .replace(0., -1.)
+            )
 
         return self
 
@@ -1270,6 +1287,7 @@ class KerasPoisson:
             # # del train_ohe_cols, test_ohe_cols
 
             print(f"Train_X columns are: {self.train_X.columns.to_list()}")
+            print(f"Shape of Train_X is {self.train_X.shape}")
 
             try:
                 self.model = keras.Sequential()
@@ -1291,6 +1309,7 @@ class KerasPoisson:
                 self.model.add(layers.Dense(1, activation="exponential"))
 
                 opt = optimizers.Adam(learning_rate=0.001)
+                callback = callbacks.EarlyStopping(monitor='loss', patience=3)
                 self.model.compile(
                     loss="poisson",
                     optimizer=opt,
@@ -1311,9 +1330,10 @@ class KerasPoisson:
                     self.test_X,
                     test["sid_shop_item_qty_sold_day"].to_numpy(),
                 ),
-                epochs=50,
+                epochs=20,
                 batch_size=64,
                 shuffle=True,
+                callbacks=[callback],
                 verbose=2,
             )
             print(f"History keys: {history.history.keys()}")
@@ -1385,13 +1405,16 @@ class KerasPoisson:
                         plt.plot(history.history[f"val_{m}"])
                         # pyplot.plot(history.history['loss'], label='train')
                         # pyplot.plot(history.history['val_loss'], label='test')
-                        plt.title("Model Poisson Metric")
-                        plt.ylabel("Poisson")
+                        plt.title(f"Model {m.replace('_',' ').title()} Metric")
+                        plt.ylabel(f"{m.replace('_',' ').title()}")
                         plt.xlabel("Epoch")
+                        left, right = plt.xlim()
+                        plt.xticks(np.arange(left + 1, right + 2, step=1))  # Set tick locations.
                         plt.legend(["Train", "Test"], loc="upper left")
 
                         png_fname = combined_counter + f"_{m}.png"
                         plt.savefig(png_fname)
+                        plt.clf() # clear current figure
                         key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
                         response = s3_client.upload_file(
                             png_fname, "sales-demand-data", key
@@ -1573,6 +1596,13 @@ def main():
     )
 
     parser.add_argument(
+        "--effect_coding", "-e",
+        help="whether use -1 and 1 for binary inputs (if included) or 0 and 1 (if not included)",
+        default=False,
+        action="store_true",
+    )
+
+    parser.add_argument(
         "--add_princomps",
         "-c",
         help="create specified number of additional principal component features (if included), or not (if not included)",
@@ -1682,8 +1712,8 @@ def main():
         f"Running Keras Poisson model with s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
         f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
-        f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, add_princomps: {args.add_princomps}, "
-        f"and add_interactions: {args.add_interactions}..."
+        f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
+        f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}..."
     )
 
     model = KerasPoisson(
@@ -1696,6 +1726,7 @@ def main():
         frac=args.frac,
         # normalize_tx=args.normalize_tx,
         scaler=args.scaler,
+        effect_coding=args.effect_coding,
         add_princomps=args.add_princomps,
         add_interactions=args.add_interactions,
     )
