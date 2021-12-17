@@ -1,5 +1,6 @@
 import argparse
 import datetime
+import json
 import logging
 import os
 from pathlib import Path
@@ -101,10 +102,67 @@ def make_stations_db_table(stop_db=False):
         stop_instance()
 
 
+def get_shop_to_station_distances(stop_db=False):
+
+    start_instance()
+
+    conn = None
+    try:
+        # read connection parameters
+        db_params = config(section="postgresql")
+
+        # connect to the PostgreSQL server
+        logging.info("Connecting to the PostgreSQL database...")
+        conn = psycopg2.connect(**db_params)
+        conn.autocommit = True
+
+        # create a cursor to perform database operations
+        # cur = conn.cursor()
+        with conn.cursor() as cur:
+            sql = (
+                "ALTER TABLE shops DROP COLUMN IF EXISTS latlon; "
+                "ALTER TABLE shops ADD latlon GEOMETRY; "
+                "UPDATE shops SET latlon = ST_SetSRID(ST_MakePoint(s_geo_lon, s_geo_lat), 4326); "
+                "ALTER TABLE weather_stations DROP COLUMN IF EXISTS latlon; "
+                "ALTER TABLE weather_stations ADD latlon GEOMETRY; "
+                "UPDATE weather_stations SET latlon = ST_SetSRID(ST_MakePoint(longitude, latitude), 4326); "
+                "SELECT t1.shop_id, t2.station_id, "
+                "t2.latlon::geography <-> t1.latlon::geography as distance FROM "
+                "(SELECT t1.shop_id as g1, (SELECT t.station_id FROM "
+                "weather_stations AS t ORDER BY t.latlon <-> t1.latlon ASC LIMIT 1) "
+                "AS g2 FROM shops AS t1) as q JOIN shops AS t1 ON q.g1 = t1.shop_id "
+                "JOIN weather_stations AS t2 ON q.g2 = t2.station_id"
+            )
+            for q in sql.split("; "):
+                logging.debug(f"SQL query to be executed: {q}")
+                cur.execute(q)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
+                if "SELECT" in q:
+                    shop_station_distances = {s[0]: s[1:] for s in cur.fetchall()}
+
+        for line in conn.notices:
+            logging.debug(line.strip("\n"))
+
+        with open("../data/shop_to_weather_station_map.json", "w") as f:
+            json.dump(shop_station_distances, f)
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logging.exception("Exception occurred")
+
+    finally:
+        if conn is not None:
+            conn.close()
+            logging.info("Database connection closed.")
+
+    if stop_db:
+        stop_instance()
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", metavar="<command>", help="'csv' or 'db'",
+        "command", metavar="<command>", help="'csv', 'db' or 'map'",
     )
     parser.add_argument(
         "--stop",
@@ -115,8 +173,8 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ["csv", "db"]:
-        print("'{}' is not recognized. " "Use 'csv' or 'db'".format(args.command))
+    if args.command not in ("csv", "db", "map"):
+        print("'{}' is not recognized. " "Use 'csv', 'db' or 'map'".format(args.command))
 
     fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -144,6 +202,8 @@ def main():
         make_stations_csv()
     elif args.command == "db":
         make_stations_db_table(stop_db=args.stop)
+    elif args.command == "map":
+        get_shop_to_station_distances(stop_db=args.stop)
 
 
 if __name__ == "__main__":
