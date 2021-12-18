@@ -43,7 +43,7 @@ def make_stations_csv():
 
     rus_data = df[df.id.str.startswith("RSM")].reset_index(drop=True)
 
-    rus_data.to_csv("../data/rus_weather_stations.csv", sep='\t', index=False)
+    rus_data.to_csv("../data/rus_weather_stations.csv", sep="\t", index=False)
 
 
 def make_stations_db_table(stop_db=False):
@@ -158,11 +158,61 @@ def get_shop_to_station_distances(stop_db=False):
         stop_instance()
 
 
+def get_data_summary():
+    with open("../data/shop_to_weather_station_map.json", "r") as f:
+        shop_station_distances = json.load(f)
+
+    first_day = datetime.date(2012, 12, 1)
+    last_day = datetime.date(2015, 12, 31)
+
+    summary_df = None
+    for shop_id, station_info in shop_station_distances.items():
+        station_url = (
+            f"https://www.ncei.noaa.gov/data/global-historical-"
+            f"climatology-network-daily/access/{station_info[0]}.csv"
+        )
+
+        # shop_station_distances[shop_id].append(
+        #     pd.read_csv(station_url, parse_dates=['DATE']).query("@first_day <= DATE <= @last_day").reset_index(drop=True)
+        # )
+        station_data = (
+            pd.read_csv(station_url, parse_dates=["DATE"])
+            .query("@first_day <= DATE <= @last_day")
+            .reset_index(drop=True)
+        )
+
+        if summary_df is None:
+            summary_df = pd.DataFrame(
+                station_data.isnull().sum().to_dict(), index=[shop_id]
+            )
+            summary_df.index.rename("shop_id")
+            summary_df["num_rows"] = station_data["DATE"].count()
+            summary_df["num_unique_dates"] = station_data["DATE"].nunique()
+        else:
+            summary_df = pd.concat(
+                [
+                    summary_df,
+                    pd.DataFrame(
+                        station_data.isnull().sum().to_dict(), index=[shop_id]
+                    ),
+                ],
+                axis=0,
+            )
+            summary_df.loc[shop_id, "num_rows"] = station_data["DATE"].count()
+            summary_df.loc[shop_id, "num_unique_dates"] = station_data["DATE"].nunique()
+
+        summary_df.to_csv("../data/rus_weather_stations_data_summary.csv", sep=",", index=True)
+
+        # num_rows = shop_station_distances[shop_id][-1]['DATE'].count()
+        # num_unique_dates = shop_station_distances[shop_id][-1]['DATE'].nunique()
+        # column_names = shop_station_distances[shop_id][-1].columns.to_list()
+        # null_value_cts = shop_station_distances[shop_id][-1].isnull().sum().to_dict()
+
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", metavar="<command>", help="'csv', 'db' or 'map'",
+        "command", metavar="<command>", help="'csv', 'db', 'map' or 'summary'",
     )
     parser.add_argument(
         "--stop",
@@ -173,8 +223,11 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ("csv", "db", "map"):
-        print("'{}' is not recognized. " "Use 'csv', 'db' or 'map'".format(args.command))
+    if args.command not in ("csv", "db", "map", "summary"):
+        print(
+            "'{}' is not recognized. "
+            "Use 'csv', 'db', 'map' or 'summary'".format(args.command)
+        )
 
     fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
     datefmt = "%Y-%m-%d %H:%M:%S"
@@ -204,6 +257,8 @@ def main():
         make_stations_db_table(stop_db=args.stop)
     elif args.command == "map":
         get_shop_to_station_distances(stop_db=args.stop)
+    elif args.command == "summary":
+        get_data_summary()
 
 
 if __name__ == "__main__":
