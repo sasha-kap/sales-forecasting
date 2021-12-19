@@ -102,7 +102,10 @@ def make_stations_db_table(stop_db=False):
         stop_instance()
 
 
-def get_shop_to_station_distances(stop_db=False):
+def get_shop_to_station_distances(prelim_query=None, stop_db=False):
+    """Need to add the option to delete weather stations that do not have
+    complete data before perfoming the nearest neighbor search.
+    """
 
     start_instance()
 
@@ -116,8 +119,6 @@ def get_shop_to_station_distances(stop_db=False):
         conn = psycopg2.connect(**db_params)
         conn.autocommit = True
 
-        # create a cursor to perform database operations
-        # cur = conn.cursor()
         with conn.cursor() as cur:
             sql = (
                 "ALTER TABLE shops DROP COLUMN IF EXISTS latlon; "
@@ -133,6 +134,10 @@ def get_shop_to_station_distances(stop_db=False):
                 "AS g2 FROM shops AS t1) as q JOIN shops AS t1 ON q.g1 = t1.shop_id "
                 "JOIN weather_stations AS t2 ON q.g2 = t2.station_id"
             )
+            if prelim_query is not None:
+                q, params = prelim_query
+                logging.debug(f"SQL query to be executed: {cur.mogrify(q, (params,))}")
+                cur.execute(q, (params,))
             for q in sql.split("; "):
                 logging.debug(f"SQL query to be executed: {q}")
                 cur.execute(q)
@@ -172,9 +177,6 @@ def get_data_summary():
             f"climatology-network-daily/access/{station_info[0]}.csv"
         )
 
-        # shop_station_distances[shop_id].append(
-        #     pd.read_csv(station_url, parse_dates=['DATE']).query("@first_day <= DATE <= @last_day").reset_index(drop=True)
-        # )
         station_data = (
             pd.read_csv(station_url, parse_dates=["DATE"])
             .query("@first_day <= DATE <= @last_day")
@@ -201,18 +203,73 @@ def get_data_summary():
             summary_df.loc[shop_id, "num_rows"] = station_data["DATE"].count()
             summary_df.loc[shop_id, "num_unique_dates"] = station_data["DATE"].nunique()
 
-        summary_df.to_csv("../data/rus_weather_stations_data_summary.csv", sep=",", index=True)
+        summary_df.to_csv(
+            "../data/rus_weather_stations_data_summary.csv", sep=",", index=True
+        )
 
-        # num_rows = shop_station_distances[shop_id][-1]['DATE'].count()
-        # num_unique_dates = shop_station_distances[shop_id][-1]['DATE'].nunique()
-        # column_names = shop_station_distances[shop_id][-1].columns.to_list()
-        # null_value_cts = shop_station_distances[shop_id][-1].isnull().sum().to_dict()
+
+def list_of_stations_to_remove(df):
+    shops_w_zero_weather_data = df[df.num_rows == 0].index.to_list()
+    shops_w_missing_prcp_vls = df[df.PRCP > 0].index.to_list()
+    shops_w_missing_temp_vls = df[df.TMAX > 0].index.to_list()
+    shops_needing_new_station = set(
+        [
+            *shops_w_zero_weather_data,
+            *shops_w_missing_prcp_vls,
+            *shops_w_missing_temp_vls,
+        ]
+    )
+
+    if len(shops_needing_new_station) == 0:
+        return None
+
+    with open("../data/shop_to_weather_station_map.json", "r") as f:
+        shop_station_distances = json.load(f)
+    stations_to_remove = tuple(
+        [
+            v[0]
+            for k, v in shop_station_distances.items()
+            if int(k) in shops_needing_new_station
+        ]
+    )
+
+    return stations_to_remove
+
+
+def revise_nn_stations():
+    incomplete_data = True
+    while incomplete_data:
+        # get ids of stations with incomplete data from summary csv
+        summary_df = pd.read_csv(
+            "../data/rus_weather_stations_data_summary.csv",
+            sep=",",
+            header=0,
+            index_col=0,
+        )
+        stations_to_remove = list_of_stations_to_remove(summary_df)
+        if stations_to_remove is not None:
+            # pass query statement to delete those stations from weather_stations table
+            # to the get_shop_to_station_distances() function
+            # and get new nearest neighbors
+            delete_query = "DELETE FROM weather_stations WHERE station_id IN %s"
+            get_shop_to_station_distances(
+                prelim_query=(delete_query, stations_to_remove)
+            )
+
+            # run get_data_summary() function to create updated summary CSV
+            # check if all stations have complete data
+            # set incomplete_data to False if all stations have complete data
+            get_data_summary()
+        else:
+            incomplete_data = False
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "command", metavar="<command>", help="'csv', 'db', 'map' or 'summary'",
+        "command",
+        metavar="<command>",
+        help="'csv', 'db', 'map', 'summary' or 'revise'",
     )
     parser.add_argument(
         "--stop",
@@ -223,10 +280,10 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ("csv", "db", "map", "summary"):
+    if args.command not in ("csv", "db", "map", "summary", "revise"):
         print(
             "'{}' is not recognized. "
-            "Use 'csv', 'db', 'map' or 'summary'".format(args.command)
+            "Use 'csv', 'db', 'map', 'summary' or 'revise'".format(args.command)
         )
 
     fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
@@ -259,6 +316,8 @@ def main():
         get_shop_to_station_distances(stop_db=args.stop)
     elif args.command == "summary":
         get_data_summary()
+    elif args.command == "revise":
+        revise_nn_stations()
 
 
 if __name__ == "__main__":
