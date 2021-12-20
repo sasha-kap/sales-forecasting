@@ -32,6 +32,9 @@ from utils.write_df_to_sql_table import psql_insert_copy, write_df_to_sql
 
 @Timer(logger=logging.info)
 def make_stations_csv():
+    """Create a CSV file of Russian weather stations and their GPS
+    coordinates and other characteristics.
+    """
 
     stations_url = (
         "https://www.ncei.noaa.gov/data/global-historical-"
@@ -63,6 +66,9 @@ def make_stations_csv():
 
 @Timer(logger=logging.info)
 def make_stations_db_table(stop_db=False):
+    """Load dataset with Russian weather stations and their characteristics
+    to PostgreSQL database.
+    """
 
     start_instance()
 
@@ -120,8 +126,16 @@ def make_stations_db_table(stop_db=False):
 
 @Timer(logger=logging.info)
 def get_shop_to_station_distances(prelim_query=None, stop_db=False):
-    """Need to add the option to delete weather stations that do not have
-    complete data before perfoming the nearest neighbor search.
+    """Connect to PostgreSQL database and execute queries to identify
+    the nearest weather station to each shop.
+
+    Parameters:
+    -----------
+    prelim_query : tuple
+        Optional; 2-tuple containing SQL query string to delete weather stations that
+        do not have complete weather data and a tuple of ID's of the weather
+        stations that need to be deleted before the nearest neighbor search
+        is performed.
     """
 
     start_instance()
@@ -182,6 +196,10 @@ def get_shop_to_station_distances(prelim_query=None, stop_db=False):
 
 @Timer(logger=logging.info)
 def get_data_summary():
+    """Download daily weather data for each weather station for the desired
+    period and produce a file summarizing completeness of each station's data.
+    """
+
     with open("../data/shop_to_weather_station_map.json", "r") as f:
         shop_station_distances = json.load(f)
 
@@ -227,6 +245,19 @@ def get_data_summary():
 
 
 def list_of_stations_to_remove(df):
+    """Produce list of weather stations that have incomplete daily
+    weather data and that need to be removed from the database.
+
+    Parameters:
+    -----------
+    df : DataFrame
+        Dataframe created from CSV containing data completeness summary for
+        each weather station
+
+    Returns:
+    --------
+    Tuple of weather station ID's or None if no stations need to be removed
+    """
     shops_w_zero_weather_data = df[df.num_rows == 0].index.to_list()
     shops_w_missing_prcp_vls = df[df.PRCP > 0].index.to_list()
     shops_w_missing_temp_vls = df[df.TMAX > 0].index.to_list()
@@ -256,6 +287,11 @@ def list_of_stations_to_remove(df):
 
 @Timer(logger=logging.info)
 def revise_nn_stations():
+    """Identify stations that have incomplete weather data, delete them
+    from weather_stations database table and identify new nearest neighbor
+    weather stations, producing new summary file.  Repeat the process until
+    every nearest neighbor weather station's data is complete.
+    """
     incomplete_data = True
     while incomplete_data:
         # get ids of stations with incomplete data from summary csv
@@ -285,6 +321,15 @@ def revise_nn_stations():
 
 @Timer(logger=logging.info)
 def get_weather_data_into_db(test_run=False, stop_db=False):
+    """Download each weather station's daily weather data from the web and
+    upload in consistent format to the PostgreSQL shop_dates_weather table.
+
+    Parameters:
+    -----------
+    test_run : bool
+        Skip actually writing data to DB (if True) and only produce a summary
+        of SQL data types for each station's data, or do not skip (if False)
+    """
     with open("./data/shop_to_weather_station_map.json", "r") as f:
         shop_station_distances = json.load(f)
 
