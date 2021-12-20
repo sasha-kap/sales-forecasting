@@ -4,18 +4,33 @@ import json
 import logging
 import os
 from pathlib import Path
+import platform
 import sys
 
+import boto3
+from botocore.exceptions import ClientError
+from ec2_metadata import ec2_metadata
 import pandas as pd
-import psycopg2  # import the postgres library
+import psycopg2
+from sqlalchemy.types import Float, INTEGER
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
+
+from prep_time_series_data import (
+    _add_col_prefix,
+    _downcast,
+    _map_to_sql_dtypes,
+    upload_file,
+)
+
 # Import the 'config' function from the config.py file
 from utils.config import config
 from utils.rds_instance_mgmt import start_instance, stop_instance
 from utils.timer import Timer
+from utils.write_df_to_sql_table import psql_insert_copy, write_df_to_sql
 
 
+@Timer(logger=logging.info)
 def make_stations_csv():
 
     stations_url = (
@@ -46,6 +61,7 @@ def make_stations_csv():
     rus_data.to_csv("../data/rus_weather_stations.csv", sep="\t", index=False)
 
 
+@Timer(logger=logging.info)
 def make_stations_db_table(stop_db=False):
 
     start_instance()
@@ -102,6 +118,7 @@ def make_stations_db_table(stop_db=False):
         stop_instance()
 
 
+@Timer(logger=logging.info)
 def get_shop_to_station_distances(prelim_query=None, stop_db=False):
     """Need to add the option to delete weather stations that do not have
     complete data before perfoming the nearest neighbor search.
@@ -163,6 +180,7 @@ def get_shop_to_station_distances(prelim_query=None, stop_db=False):
         stop_instance()
 
 
+@Timer(logger=logging.info)
 def get_data_summary():
     with open("../data/shop_to_weather_station_map.json", "r") as f:
         shop_station_distances = json.load(f)
@@ -236,6 +254,7 @@ def list_of_stations_to_remove(df):
     return stations_to_remove
 
 
+@Timer(logger=logging.info)
 def revise_nn_stations():
     incomplete_data = True
     while incomplete_data:
@@ -264,12 +283,94 @@ def revise_nn_stations():
             incomplete_data = False
 
 
+@Timer(logger=logging.info)
+def get_weather_data_into_db(test_run=False, stop_db=False):
+    with open("./data/shop_to_weather_station_map.json", "r") as f:
+        shop_station_distances = json.load(f)
+
+    first_day = datetime.date(2012, 12, 1)
+    last_day = datetime.date(2015, 12, 31)
+
+    for counter, (shop_id, station_info) in enumerate(
+        shop_station_distances.items(), 1
+    ):
+        station_url = (
+            f"https://www.ncei.noaa.gov/data/global-historical-"
+            f"climatology-network-daily/access/{station_info[0]}.csv"
+        )
+
+        station_data = (
+            pd.read_csv(station_url, parse_dates=["DATE"])
+            .query("@first_day <= DATE <= @last_day")
+            .filter(
+                items=[
+                    "STATION",
+                    "DATE",
+                    "LATITUDE",
+                    "LONGITUDE",
+                    "ELEVATION",
+                    "NAME",
+                    "PRCP",
+                    "PRCP_ATTRIBUTES",
+                    "TMAX",
+                    "TMAX_ATTRIBUTES",
+                    "TMIN",
+                    "TMIN_ATTRIBUTES",
+                ]
+            )
+            .reset_index(drop=True)
+        )
+        station_data.columns = [col.lower() for col in station_data]
+
+        station_data["shop_id"] = shop_id
+        station_data["shop_id"] = station_data["shop_id"].astype("uint8")
+
+        station_data["distance"] = station_info[1]
+
+        station_data = _add_col_prefix(station_data, "sdw_")
+        station_data.rename(columns={"date": "sale_date"}, inplace=True)
+
+        # next: how to make sure that PRCP, TMAX and TMIN columns are numeric in the station_data DF
+        # create actual features in pandas (figure out how to deal with online stores)
+        # is creating features here the best idea, or is it better to do some data checks/cleaning first
+
+        # upload table with correct features to PostgreSQL
+        station_data = _downcast(station_data)
+        dtypes_dict = _map_to_sql_dtypes(station_data)
+        logging.debug(
+            f"dtypes_dict of counter {counter} and shop_id {shop_id} is: {dtypes_dict}"
+        )
+
+        if not test_run:
+            # based on results of test run that showed that a couple of columns
+            # ended up having different SQL data types in different station data files
+            # 'sdw_longitude': Float(precision=3, asdecimal=True) - 55 shops + 'sdw_longitude': SMALLINT() - 3 shops
+            dtypes_dict['sdw_longitude'] = Float(precision=3, asdecimal=True)
+            # 'sdw_elevation': SMALLINT() - 56 shops + 'sdw_elevation': INTEGER() - 2 shops
+            dtypes_dict['sdw_elevation'] = INTEGER()
+
+            start_instance()
+            write_df_to_sql(
+                station_data,
+                "shop_dates_weather",
+                dtypes_dict,
+                if_exists="replace" if counter == 1 else "append",
+            )
+    if not test_run and stop_db:
+        stop_instance()
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
         metavar="<command>",
-        help="'csv', 'db', 'map', 'summary' or 'revise'",
+        help="'csv', 'db', 'map', 'summary', 'revise', 'to_sql'",
+    )
+    parser.add_argument(
+        "--test_run",
+        default=False,
+        action="store_true",
+        help="run write to SQL code skpping actually writing data to DB (if included) or not skipping (if not)",
     )
     parser.add_argument(
         "--stop",
@@ -280,10 +381,10 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ("csv", "db", "map", "summary", "revise"):
+    if args.command not in ("csv", "db", "map", "summary", "revise", "to_sql"):
         print(
             "'{}' is not recognized. "
-            "Use 'csv', 'db', 'map', 'summary' or 'revise'".format(args.command)
+            "Use 'csv', 'db', 'map', 'summary', 'revise' or 'to_sql'".format(args.command)
         )
 
     fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
@@ -308,6 +409,29 @@ def main():
     logging.getLogger("s3transfer").setLevel(logging.CRITICAL)
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 
+    # Check if code is being run on EC2 instance (vs locally)
+    my_user = os.environ.get("USER")
+    is_aws = True if "ec2" in my_user else False
+    # Log EC2 instance name and type metadata
+    if is_aws:
+        instance_metadata = dict()
+        instance_metadata['EC2 instance ID'] = ec2_metadata.instance_id
+        instance_metadata['EC2 instance type'] = ec2_metadata.instance_type
+        instance_metadata['EC2 instance public hostname'] = ec2_metadata.public_hostname
+
+        f = lambda x: ": ".join(x)
+        r = list(map(f, list(instance_metadata.items())))
+        nl = "\n" + " " * 55
+        logging.info(
+            f"Script is running on EC2 instance with the following metadata: "
+            f"{nl}{nl.join(r)}"
+        )
+    else:
+        logging.info("Script is running on local machine, not on EC2 instance.")
+
+    logging.info(f"The Python version is {platform.python_version()}.")
+    logging.info(f"The pandas version is {pd.__version__}.")
+
     if args.command == "csv":
         make_stations_csv()
     elif args.command == "db":
@@ -318,6 +442,11 @@ def main():
         get_data_summary()
     elif args.command == "revise":
         revise_nn_stations()
+    elif args.command == "to_sql":
+        get_weather_data_into_db(test_run=args.test_run, stop_db=args.stop)
+
+    # copy log file to S3 bucket
+    upload_file(f"./logs/{log_fname}", "my-ec2-logs", log_fname)
 
 
 if __name__ == "__main__":
