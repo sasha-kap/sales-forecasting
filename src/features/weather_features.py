@@ -404,12 +404,204 @@ def get_weather_data_into_db(test_run=False, stop_db=False):
     if not test_run and stop_db:
         stop_instance()
 
+
+@Timer(logger=logging.info)
+def generate_features(stop_db=False):
+    start_instance()
+    conn = None
+    try:
+        # read connection parameters
+        db_params = config(section="postgresql")
+
+        # connect to the PostgreSQL server
+        logging.info("Connecting to the PostgreSQL database...")
+        conn = psycopg2.connect(**db_params)
+        conn.autocommit = True
+
+        # create a cursor to perform database operations
+        # cur = conn.cursor()
+        with conn.cursor() as cur:
+            sql = (
+                # divide temperature values by 10
+                "ALTER TABLE shop_dates_weather "
+                "ALTER COLUMN sdw_tmin TYPE real; "
+                "ALTER TABLE shop_dates_weather "
+                "ALTER COLUMN sdw_tmax TYPE real; "
+                "UPDATE shop_dates_weather SET sdw_tmin = "
+                "sdw_tmin / 10; "
+                "UPDATE shop_dates_weather SET sdw_tmax = "
+                "sdw_tmax / 10; "
+                # add 1-day lag differences in temperature values
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmin_diff_lag real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "sdw_tmin - LAG(sdw_tmin) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_tmin_diff_lag "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmin_diff_lag = cte.sdw_tmin_diff_lag "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmax_diff_lag real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "sdw_tmax - LAG(sdw_tmax) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_tmax_diff_lag "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmax_diff_lag = cte.sdw_tmax_diff_lag "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add 1-day lead differences in temperature values
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmin_diff_lead real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "LEAD(sdw_tmin) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) - sdw_tmin "
+                "AS sdw_tmin_diff_lead "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmin_diff_lead = cte.sdw_tmin_diff_lead "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmax_diff_lead real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "LEAD(sdw_tmax) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) - sdw_tmax "
+                "AS sdw_tmax_diff_lead "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmax_diff_lead = cte.sdw_tmax_diff_lead "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add 1-day lag difference in precipitation values
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_prcp_diff_lag int; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, sdw_prcp - LAG(sdw_prcp) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_prcp_diff_lag "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_prcp_diff_lag = cte.sdw_prcp_diff_lag "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add 1-day lead difference in precipitation values
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_prcp_diff_lead int; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, LEAD(sdw_prcp) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) - sdw_prcp "
+                "AS sdw_prcp_diff_lead "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_prcp_diff_lead = cte.sdw_prcp_diff_lead "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add count of days with precipitation in last week
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_days_w_prcp_last_7d int; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "SUM(CASE WHEN sdw_prcp > 0 THEN 1 ELSE 0 END) OVER "
+                "(PARTITION BY shop_id ORDER BY sale_date "
+                "ROWS BETWEEN 8 PRECEDING AND 1 PRECEDING) AS sdw_days_w_prcp_last_7d "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_days_w_prcp_last_7d = cte.sdw_days_w_prcp_last_7d "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add total precipitation over last week
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_total_prcp_last_7d int; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, SUM(sdw_prcp) OVER "
+                "(PARTITION BY shop_id ORDER BY sale_date "
+                "ROWS BETWEEN 8 PRECEDING AND 1 PRECEDING) AS sdw_total_prcp_last_7d "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_total_prcp_last_7d = cte.sdw_total_prcp_last_7d "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add 7, 14 and 21 day lag differences in max temperature values
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmax_diff_lag7 real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "sdw_tmax - LAG(sdw_tmax, 7) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_tmax_diff_lag7 "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmax_diff_lag7 = cte.sdw_tmax_diff_lag7 "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmax_diff_lag14 real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "sdw_tmax - LAG(sdw_tmax, 14) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_tmax_diff_lag14 "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmax_diff_lag14 = cte.sdw_tmax_diff_lag14 "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_tmax_diff_lag21 real; "
+                "WITH cte AS ("
+                "SELECT shop_id, sale_date, "
+                "sdw_tmax - LAG(sdw_tmax, 21) "
+                "OVER (PARTITION BY shop_id ORDER BY sale_date) AS sdw_tmax_diff_lag21 "
+                "FROM shop_dates_weather) "
+                "UPDATE shop_dates_weather sdw "
+                "SET sdw_tmax_diff_lag21 = cte.sdw_tmax_diff_lag21 "
+                "FROM cte "
+                "WHERE sdw.shop_id = cte.shop_id AND sdw.sale_date = cte.sale_date; "
+                # add indicators of only positive and only negative daily temperature
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_only_neg_temp_ind smallint; "
+                "UPDATE shop_dates_weather "
+                "SET sdw_only_neg_temp_ind = CASE WHEN sdw_tmax < 0 "
+                "THEN 1 ELSE 0 END; "
+                "ALTER TABLE shop_dates_weather "
+                "ADD COLUMN sdw_only_pos_temp_ind smallint; "
+                "UPDATE shop_dates_weather "
+                "SET sdw_only_pos_temp_ind = CASE WHEN sdw_tmin > 0 "
+                "THEN 1 ELSE 0 END"
+            )
+            for q in sql.split("; "):
+                logging.debug(f"SQL query to be executed: {q}")
+                cur.execute(q)
+                logging.debug(f"cur.statusmessage is {cur.statusmessage}")
+
+        # Make the changes to the database persistent
+        conn.commit()
+
+        for line in conn.notices:
+            logging.debug(line.strip("\n"))
+
+    except (Exception, psycopg2.DatabaseError) as error:
+        logging.exception("Exception occurred")
+
+    finally:
+        if conn is not None:
+            conn.close()
+            logging.info("Database connection closed.")
+
+    if stop_db:
+        stop_instance()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
         metavar="<command>",
-        help="'csv', 'db', 'map', 'summary', 'revise', 'to_sql'",
+        help="'csv', 'db', 'map', 'summary', 'revise', 'to_sql' or 'features'",
     )
     parser.add_argument(
         "--test_run",
@@ -426,10 +618,10 @@ def main():
 
     args = parser.parse_args()
 
-    if args.command not in ("csv", "db", "map", "summary", "revise", "to_sql"):
+    if args.command not in ("csv", "db", "map", "summary", "revise", "to_sql", "features"):
         print(
             "'{}' is not recognized. "
-            "Use 'csv', 'db', 'map', 'summary', 'revise' or 'to_sql'".format(args.command)
+            "Use 'csv', 'db', 'map', 'summary', 'revise', 'to_sql' or 'features'".format(args.command)
         )
 
     fmt = "%(name)-12s : %(asctime)s %(levelname)-8s %(lineno)-7d %(message)s"
@@ -489,6 +681,8 @@ def main():
         revise_nn_stations()
     elif args.command == "to_sql":
         get_weather_data_into_db(test_run=args.test_run, stop_db=args.stop)
+    elif args.command == "features":
+        generate_features(stop_db=args.stop)
 
     # copy log file to S3 bucket
     upload_file(f"./logs/{log_fname}", "my-ec2-logs", log_fname)
