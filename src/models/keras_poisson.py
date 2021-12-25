@@ -64,13 +64,11 @@ from sklearn.preprocessing import (
     StandardScaler,
 )
 from tensorflow import keras
-from tensorflow.keras import (
-    callbacks,
-    initializers,
-    layers,
-    metrics,
-    optimizers
-)
+from tensorflow.keras import callbacks, initializers, layers, metrics, optimizers
+
+sys.path.insert(1, os.path.join(sys.path[0], ".."))
+from utils.rds_db_commands import df_from_sql_table
+from utils.rds_instance_mgmt import start_instance
 
 
 def month_counter(fm, LAST_DAY_OF_TRAIN_PRD=(2015, 10, 31)):
@@ -492,6 +490,7 @@ class KerasPoisson:
         pipe_steps,
         frac=None,
         # normalize_tx=False,
+        add_weather_features=False,
         scaler="s",
         effect_coding=False,
         add_princomps=0,
@@ -503,6 +502,7 @@ class KerasPoisson:
         self.n_months_in_val_set = n_months_in_val_set
         self.pipe_steps = pipe_steps
         self.frac = frac if frac is not None else 1.0
+        self.add_weather_features = add_weather_features
         # self.normalize_tx = normalize_tx
         self.scaler = scaler
         self.effect_coding = effect_coding
@@ -585,6 +585,12 @@ class KerasPoisson:
 
                 # self.full_dataset = self.client.persist(self.full_dataset)
                 # _ = wait([self.full_dataset])
+
+                if self.add_weather_features:
+                    weather_df = self.get_weather_data()
+                    self.full_dataset = self.full_dataset.merge(
+                        weather_df, on=["shop_id", "sale_date"], how="left",
+                    )
 
                 # https://docs.dask.org/en/latest/generated/dask.dataframe.DataFrame.repartition.html
                 # self.full_dataset = self.full_dataset.repartition(partition_size="100MB")
@@ -757,6 +763,53 @@ class KerasPoisson:
     #     if pempty is not None:
     #         ddf = dd.from_delayed(ddf_delayed_new, meta=pempty)
     #     return ddf
+
+    def get_weather_data(self, db_table_name="shop_dates_weather"):
+        # start DB instance
+        start_instance()
+
+        # get data out of the Postgres database
+        cast_dict = {
+            "shop_id": "uint8",
+            "sdw_elevation": "int16",
+            "sdw_distance": "float32",
+            "sdw_prcp": "uint16",
+            "sdw_tmax": "float32",
+            "sdw_tmin": "float32",
+            "sdw_only_neg_temp_ind": "uint8",
+            "sdw_only_pos_temp_ind": "uint8",
+            "sdw_tmin_diff_lag": "float32",
+            "sdw_tmax_diff_lag": "float32",
+            "sdw_tmin_diff_lead": "float32",
+            "sdw_tmax_diff_lead": "float32",
+            "sdw_prcp_diff_lag": "int16",
+            "sdw_prcp_diff_lead": "int16",
+            "sdw_days_w_prcp_last_7d": "uint8",
+            "sdw_total_prcp_last_7d": "int16",
+            "sdw_tmax_diff_lag7": "float32",
+            "sdw_tmax_diff_lag14": "float32",
+            "sdw_tmax_diff_lag21": "float32",
+        }
+        df = df_from_sql_table(db_table_name, cast_dict, date_list=["sale_date"])
+
+        # subset to relevant columns
+        df = df.filter(items=list(cast_dict.keys()) + ["sale_date"])
+
+        # rename binary columns to format consistent with other binary cols
+        bin_cols = ("sdw_only_neg_temp_ind", "sdw_only_pos_temp_ind")
+        last_bin_col_num = max(
+            [
+                int(x.split("_")[1])
+                for x in [col for col in self.full_dataset if col.startswith("cat")]
+            ]
+        )
+        rename_dict = {
+            col: f"cat_{i}_{col}"
+            for i, col in enumerate(bin_cols, last_bin_col_num + 1)
+        }
+        df.rename(rename_dict, axis=1, inplace=True)
+
+        return df
 
     def trunc_poisson_loss(self, y_true, y_pred):
         """Custom objective function to minimize zero-truncated Poisson.
@@ -1092,13 +1145,19 @@ class KerasPoisson:
             dtype="float32",
         )
         if self.effect_coding:
-            self.train_X[[col for col in self.train_X if col.startswith("cat")]] = (
-                self.train_X[[col for col in self.train_X if col.startswith("cat")]]
-                .replace(0., -1.)
+            self.train_X[
+                [col for col in self.train_X if col.startswith("cat")]
+            ] = self.train_X[
+                [col for col in self.train_X if col.startswith("cat")]
+            ].replace(
+                0.0, -1.0
             )
-            self.test_X[[col for col in self.test_X if col.startswith("cat")]] = (
-                self.test_X[[col for col in self.test_X if col.startswith("cat")]]
-                .replace(0., -1.)
+            self.test_X[
+                [col for col in self.test_X if col.startswith("cat")]
+            ] = self.test_X[
+                [col for col in self.test_X if col.startswith("cat")]
+            ].replace(
+                0.0, -1.0
             )
 
         return self
@@ -1292,24 +1351,39 @@ class KerasPoisson:
             try:
                 self.model = keras.Sequential()
 
+                layer_size = (
+                    2 ** (round(np.log(self.train_X.shape[1]) / np.log(2))) // 2
+                )
+
                 ki = initializers.RandomNormal(mean=0.0, stddev=0.05, seed=123)
+                # self.model.add(
+                #     layers.Dense(
+                #         128,
+                #         kernel_initializer=ki,
+                #         bias_initializer="zeros",
+                #         input_shape=(self.train_X.shape[1],),
+                #         activation="relu",
+                #     )
+                # )
+                # self.model.add(layers.Dense(128, activation="relu"))
+                # self.model.add(layers.Dense(64, activation="relu"))
                 self.model.add(
                     layers.Dense(
-                        128,
+                        layer_size,
                         kernel_initializer=ki,
                         bias_initializer="zeros",
                         input_shape=(self.train_X.shape[1],),
                         activation="relu",
                     )
                 )
-                self.model.add(layers.Dense(64, activation="relu"))
+                self.model.add(layers.Dense(layer_size // 2, activation="relu"))
                 # self.model.add(
                 #     layers.Activation("exponential")
                 # )  # need to specify number of nodes?
                 self.model.add(layers.Dense(1, activation="exponential"))
 
                 opt = optimizers.Adam(learning_rate=0.001)
-                callback = callbacks.EarlyStopping(monitor='loss', patience=3)
+                callback = callbacks.EarlyStopping(monitor="loss", patience=3)
                 self.model.compile(
                     loss="poisson",
                     optimizer=opt,
@@ -1409,12 +1483,14 @@ class KerasPoisson:
                         plt.ylabel(f"{m.replace('_',' ').title()}")
                         plt.xlabel("Epoch")
                         left, right = plt.xlim()
-                        plt.xticks(np.arange(left + 1, right + 2, step=1))  # Set tick locations.
+                        plt.xticks(
+                            np.arange(left + 1, right + 2, step=1)
+                        )  # Set tick locations.
                         plt.legend(["Train", "Test"], loc="upper left")
 
                         png_fname = combined_counter + f"_{m}.png"
                         plt.savefig(png_fname)
-                        plt.clf() # clear current figure
+                        plt.clf()  # clear current figure
                         key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
                         response = s3_client.upload_file(
                             png_fname, "sales-demand-data", key
@@ -1567,6 +1643,14 @@ def main():
         type=valid_frac,
     )
 
+    parser.add_argument(
+        "--weather",
+        "-w",
+        help="whether to incorporate weather features (if included) or not (if not included)",
+        default=False,
+        action="store_true",
+    )
+
     # parser.add_argument(
     #     "--normalize_tx",
     #     "-n",
@@ -1589,14 +1673,16 @@ def main():
     )
 
     scaler_group.add_argument(
-        "--scaler", "-s",
+        "--scaler",
+        "-s",
         help="whether to apply StandardScaler (s) (default), MinMaxScaler (m), or RobustScaler (r)",
         default="s",
         choices=["s", "m", "r"],
     )
 
     parser.add_argument(
-        "--effect_coding", "-e",
+        "--effect_coding",
+        "-e",
         help="whether use -1 and 1 for binary inputs (if included) or 0 and 1 (if not included)",
         default=False,
         action="store_true",
@@ -1712,8 +1798,9 @@ def main():
         f"Running Keras Poisson model with s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
         f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
+        f"weather features: {args.weather}",
         f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
-        f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}..."
+        f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}...",
     )
 
     model = KerasPoisson(
@@ -1724,6 +1811,7 @@ def main():
         args.n_months_in_val_set,
         args.pipe_steps,
         frac=args.frac,
+        add_weather_features=args.weather,
         # normalize_tx=args.normalize_tx,
         scaler=args.scaler,
         effect_coding=args.effect_coding,
