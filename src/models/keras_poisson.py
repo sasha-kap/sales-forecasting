@@ -53,6 +53,7 @@ from scipy.misc import derivative
 from scipy.special import gamma
 from sklearn.compose import ColumnTransformer
 from sklearn.decomposition import PCA
+from sklearn.dummy import DummyRegressor
 from sklearn.metrics import mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -1086,9 +1087,21 @@ class KerasPoisson:
 
         if self.add_princomps > 0 or self.add_interactions:
             train_X = pd.concat(
-                [train_X, train_pcs_df, *train_interaction_df_list], axis=1
+                [
+                    train_X[[col for col in train_X if col.startswith("cat")]],
+                    train_pcs_df,
+                    *train_interaction_df_list,
+                ],
+                axis=1,
             )
-            test_X = pd.concat([test_X, test_pcs_df, *test_interaction_df_list], axis=1)
+            test_X = pd.concat(
+                [
+                    test_X[[col for col in test_X if col.startswith("cat")]],
+                    test_pcs_df,
+                    *test_interaction_df_list,
+                ],
+                axis=1,
+            )
             del (
                 train_pcs_df,
                 test_pcs_df,
@@ -1356,17 +1369,6 @@ class KerasPoisson:
                 )
 
                 ki = initializers.RandomNormal(mean=0.0, stddev=0.05, seed=123)
-                # self.model.add(
-                #     layers.Dense(
-                #         128,
-                #         kernel_initializer=ki,
-                #         bias_initializer="zeros",
-                #         input_shape=(self.train_X.shape[1],),
-                #         activation="relu",
-                #     )
-                # )
-                # self.model.add(layers.Dense(128, activation="relu"))
-                # self.model.add(layers.Dense(64, activation="relu"))
                 self.model.add(
                     layers.Dense(
                         layer_size,
@@ -1376,13 +1378,35 @@ class KerasPoisson:
                         activation="relu",
                     )
                 )
-                self.model.add(layers.Dense(layer_size // 2, activation="relu"))
+                # self.model.add(layers.Dropout(0.2))
+                self.model.add(layers.Dense(layer_size, activation="relu"))
+                # self.model.add(layers.Dropout(0.2))
+                # self.model.add(layers.Dense(64, activation="relu"))
+                # self.model.add(
+                #     layers.Dense(
+                #         layer_size,
+                #         kernel_initializer=ki,
+                #         bias_initializer="zeros",
+                #         input_shape=(self.train_X.shape[1],),
+                #         activation="relu",
+                #     )
+                # )
+                # self.model.add(layers.Dense(layer_size // 2, activation="relu"))
                 # self.model.add(
                 #     layers.Activation("exponential")
                 # )  # need to specify number of nodes?
                 self.model.add(layers.Dense(1, activation="exponential"))
 
                 opt = optimizers.Adam(learning_rate=0.001)
+                # initial_learning_rate = 0.1
+                # lr_schedule = optimizers.schedules.ExponentialDecay(
+                #     initial_learning_rate,
+                #     decay_steps=100_000,
+                #     decay_rate=0.96,
+                #     staircase=True
+                # )
+                # opt = optimizers.SGD(learning_rate=lr_schedule, momentum=0.9)
+                # opt = optimizers.SGD(learning_rate=0.001, momentum=0.9)
                 callback = callbacks.EarlyStopping(monitor="loss", patience=3)
                 self.model.compile(
                     loss="poisson",
@@ -1396,6 +1420,18 @@ class KerasPoisson:
                 logging.exception("Exception occurred while initializing Keras model.")
                 sys.exit(1)
 
+            # estimate baseline model
+            dummy_regr = DummyRegressor(strategy="mean")
+            dummy_regr.fit(self.train_X, train["sid_shop_item_qty_sold_day"].to_numpy())
+            dummy_regr_y_pred = dummy_regr.predict(self.train_X)
+            dummy_regr_rmse = calc_rmse(
+                self.train_X,  # just here because the function requires this argument
+                train["sid_shop_item_qty_sold_day"].to_numpy(),
+                dummy_regr_y_pred,
+                get_stats,
+            )
+            print(f"Dummy regression RMSE is {dummy_regr_rmse}.")
+
             start_time = time.perf_counter()
             history = self.model.fit(
                 x=self.train_X,  # A Numpy array (or array-like), or a list of arrays (in case the model has multiple inputs)
@@ -1404,7 +1440,7 @@ class KerasPoisson:
                     self.test_X,
                     test["sid_shop_item_qty_sold_day"].to_numpy(),
                 ),
-                epochs=20,
+                epochs=50,
                 batch_size=64,
                 shuffle=True,
                 callbacks=[callback],
