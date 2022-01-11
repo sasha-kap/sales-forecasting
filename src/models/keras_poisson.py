@@ -1407,7 +1407,7 @@ class KerasPoisson:
                 # )
                 # opt = optimizers.SGD(learning_rate=lr_schedule, momentum=0.9)
                 # opt = optimizers.SGD(learning_rate=0.001, momentum=0.9)
-                callback = callbacks.EarlyStopping(monitor="loss", patience=3)
+                callback = callbacks.EarlyStopping(monitor="loss", patience=3, restore_best_weights=True)
                 self.model.compile(
                     loss="poisson",
                     optimizer=opt,
@@ -1428,7 +1428,7 @@ class KerasPoisson:
                 self.train_X,  # just here because the function requires this argument
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 dummy_regr_y_pred,
-                get_stats,
+                False,
             )
             print(f"Dummy regression RMSE is {dummy_regr_rmse}.")
 
@@ -1518,11 +1518,16 @@ class KerasPoisson:
                         plt.title(f"Model {m.replace('_',' ').title()} Metric")
                         plt.ylabel(f"{m.replace('_',' ').title()}")
                         plt.xlabel("Epoch")
-                        left, right = plt.xlim()
+                        # left, right = plt.xlim()
+                        # plt.xticks(
+                        #     np.arange(left + 1, right + 2, step=1)
+                        # )  # Set tick locations.
+                        n_epochs = len(history.history[m])
                         plt.xticks(
-                            np.arange(left + 1, right + 2, step=1)
-                        )  # Set tick locations.
-                        plt.legend(["Train", "Test"], loc="upper left")
+                            np.arange(0, n_epochs, step=1),
+                            np.arange(1, n_epochs+1, step=1)
+                        )
+                        plt.legend(["Train", "Test"], loc="upper right")
 
                         png_fname = combined_counter + f"_{m}.png"
                         plt.savefig(png_fname)
