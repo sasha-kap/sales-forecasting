@@ -67,6 +67,7 @@ from sklearn.preprocessing import (
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import callbacks, initializers, layers, metrics, optimizers
+import tensorflow_addons as tfa
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
 from utils.rds_db_commands import df_from_sql_table
@@ -1416,9 +1417,13 @@ class KerasPoisson:
                 # )
                 # opt = optimizers.SGD(learning_rate=lr_schedule, momentum=0.9)
                 # opt = optimizers.SGD(learning_rate=0.001, momentum=0.9)
-                callback = callbacks.EarlyStopping(monitor="loss", patience=10)
+                callback = callbacks.EarlyStopping(
+                    monitor="val_rmse_metric_for_classes", patience=5, restore_best_weights=True
+                )
                 self.model.compile(
-                    loss="categorical_crossentropy",
+                    # loss="categorical_crossentropy",
+                    # loss=tfa.losses.SigmoidFocalCrossEntropy(),
+                    loss=tfa.losses.WeightedKappaLoss(num_classes=5),
                     optimizer=opt,
                     metrics=[rmse_metric_for_classes],
                 )
@@ -1437,7 +1442,7 @@ class KerasPoisson:
                 self.train_X,  # just here because the function requires this argument
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 dummy_regr_y_pred,
-                get_stats,
+                False, # no need to create predicted values distribution summary for dummy model
             )
             print(f"Dummy regression RMSE is {dummy_regr_rmse}.")
 
@@ -1445,10 +1450,10 @@ class KerasPoisson:
             history = self.model.fit(
                 x=self.train_X,  # A Numpy array (or array-like), or a list of arrays (in case the model has multiple inputs)
                 # y=train["sid_shop_item_qty_sold_day"].to_numpy(),
-                y=tf.one_hot(train["sid_shop_item_qty_sold_day"].to_numpy(), depth=5),
+                y=tf.one_hot(train["sid_shop_item_qty_sold_day"].to_numpy() - 1, depth=5),
                 validation_data=(
                     self.test_X,
-                    tf.one_hot(test["sid_shop_item_qty_sold_day"].to_numpy(), depth=5),
+                    tf.one_hot(test["sid_shop_item_qty_sold_day"].to_numpy() - 1, depth=5),
                 ),
                 epochs=50,
                 batch_size=64,
@@ -1519,7 +1524,8 @@ class KerasPoisson:
             if get_stats:
 
                 s3_client = boto3.client("s3")
-                for m in ("poisson", "root_mean_squared_error"):
+                # for m in ("poisson", "root_mean_squared_error"):
+                for m in ("rmse_metric_for_classes",):
                     try:
                         plt.plot(history.history[m])
                         plt.plot(history.history[f"val_{m}"])
@@ -1528,11 +1534,16 @@ class KerasPoisson:
                         plt.title(f"Model {m.replace('_',' ').title()} Metric")
                         plt.ylabel(f"{m.replace('_',' ').title()}")
                         plt.xlabel("Epoch")
-                        left, right = plt.xlim()
+                        # left, right = plt.xlim()
+                        # plt.xticks(
+                        #     np.arange(left + 1, right + 2, step=1)
+                        # )  # Set tick locations.
+                        n_epochs = len(history.history[m])
                         plt.xticks(
-                            np.arange(left + 1, right + 2, step=1)
-                        )  # Set tick locations.
-                        plt.legend(["Train", "Test"], loc="upper left")
+                            np.arange(0, n_epochs, step=1),
+                            np.arange(1, n_epochs+1, step=1)
+                        )
+                        plt.legend(["Train", "Test"], loc="upper right")
 
                         png_fname = combined_counter + f"_{m}.png"
                         plt.savefig(png_fname)
@@ -1848,7 +1859,7 @@ def main():
         f"Running Keras Poisson model with s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
         f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
-        f"weather features: {args.weather}",
+        f"weather features: {args.weather}, "
         f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
         f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}...",
     )
