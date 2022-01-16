@@ -66,7 +66,8 @@ from sklearn.preprocessing import (
 )
 import tensorflow as tf
 from tensorflow import keras
-from tensorflow.keras import callbacks, initializers, layers, metrics, optimizers
+from tensorflow.keras import callbacks, initializers, layers, losses, metrics, optimizers
+import tensorflow_addons as tfa
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
 from utils.rds_db_commands import df_from_sql_table
@@ -295,6 +296,36 @@ def rmse_metric_for_classes(y_true, y_pred):
     return tf.sqrt(tf.reduce_mean(squared_difference, axis=-1))
 
 
+# this loss returns ValueError: No gradients provided for any variable: ...
+# explanation of non-differentiable operation provided here:
+# https://stackoverflow.com/questions/59292992/tensorflow-2-custom-loss-no-gradients-provided-for-any-variable-error
+# but not sure how to rewrite this loss function so it works
+def mse_loss_for_classes(y_true, y_pred):
+    squared_difference = tf.cast(
+        tf.square(
+            tf.cast(tf.reduce_sum(y_true, axis=1), tf.int32)
+            - tf.reduce_sum(tf.math.cumprod(tf.cast(y_pred > 0.5, tf.int32), axis=1), axis=1)
+            # above based on https://towardsdatascience.com/how-to-perform-ordinal-regression-classification-in-pytorch-361a2a095a99
+        ),
+        tf.float32,
+    )
+    return tf.reduce_mean(squared_difference, axis=-1)
+
+
+# from https://www.tutorialexample.com/implement-focal-loss-for-multi-label-classification-in-tensorflow/
+def focal_loss(logits, labels, gamma=2.0, alpha=4.0):
+    epsilon = 1.e-9
+    probs = tf.nn.softmax(logits)
+    y_pred = tf.clip_by_value(probs, epsilon, 1. - epsilon)
+
+    ce = tf.multiply(labels, -tf.log(y_pred))
+    weight = tf.multiply(labels, tf.pow(tf.subtract(1., y_pred), gamma))
+    fl = tf.multiply(alpha, tf.multiply(weight, ce))
+    reduced_fl = tf.reduce_max(fl, axis=1)
+    # reduced_fl = tf.reduce_sum(fl, axis=1)  # same as reduce_max
+    return tf.reduce_mean(reduced_fl)
+
+
 def valid_frac(s):
     """Convert command-line fraction argument to float value.
 
@@ -470,6 +501,20 @@ params = {
 # [dict(zip(b.keys(), v)) for v in list(product(*list(b.values())))]
 
 
+class BiasLayer(layers.Layer):
+    def __init__(self, units, *args, **kwargs):
+        super(BiasLayer, self).__init__(*args, **kwargs)
+        self.bias = self.add_weight(
+            'bias',
+            shape=[units],
+            initializer='zeros',
+            trainable=True,
+        )
+
+    def call(self, x):
+        return x + self.bias
+
+
 class KerasPoisson:
     # https://github.com/Nixtla/mlforecast/blob/main/nbs/distributed.forecast.ipynb
     """
@@ -504,6 +549,7 @@ class KerasPoisson:
         pipe_steps,
         frac=None,
         # normalize_tx=False,
+        remove_sep15_from_training=False,
         add_weather_features=False,
         scaler="s",
         effect_coding=False,
@@ -516,6 +562,7 @@ class KerasPoisson:
         self.n_months_in_val_set = n_months_in_val_set
         self.pipe_steps = pipe_steps
         self.frac = frac if frac is not None else 1.0
+        self.remove_sep15_from_training = remove_sep15_from_training
         self.add_weather_features = add_weather_features
         # self.normalize_tx = normalize_tx
         self.scaler = scaler
@@ -1252,8 +1299,13 @@ class KerasPoisson:
                 get_stats = m == n_val_sets - 1
             else:
                 get_stats = False
+            if self.remove_sep15_from_training:
+                train_mask = (self.full_dataset.index <= end_date) & (~((self.full_dataset.index.year == 2015) & (self.full_dataset.index.month == 9)))
+            else:
+                train_mask = self.full_dataset.index <= end_date
             yield (
-                self.full_dataset[self.full_dataset.index <= end_date],
+                # self.full_dataset[self.full_dataset.index <= end_date],
+                self.full_dataset[train_mask],
                 self.full_dataset[
                     (self.full_dataset.index > end_date)
                     & (
@@ -1387,6 +1439,8 @@ class KerasPoisson:
                 )
 
                 ki = initializers.RandomNormal(mean=0.0, stddev=0.05, seed=123)
+                # ki = initializers.HeUniform()
+                # self.model.add(layers.BatchNormalization(input_shape=(self.train_X.shape[1],)))
                 self.model.add(
                     layers.Dense(
                         layer_size,
@@ -1396,8 +1450,19 @@ class KerasPoisson:
                         activation="relu",
                     )
                 )
+                # self.model.add(layers.LeakyReLU(alpha=0.05))
+                self.model.add(layers.BatchNormalization())
+                # self.model.add(layers.Activation('relu'))
                 # self.model.add(layers.Dropout(0.2))
-                self.model.add(layers.Dense(layer_size, activation="relu"))
+                self.model.add(
+                    layers.Dense(
+                        layer_size,
+                        activation="relu"
+                    )
+                )
+                # self.model.add(layers.LeakyReLU(alpha=0.05))
+                self.model.add(layers.BatchNormalization())
+                # self.model.add(layers.Activation('relu'))
                 # self.model.add(layers.Dropout(0.2))
                 # self.model.add(layers.Dense(64, activation="relu"))
                 # self.model.add(
@@ -1416,6 +1481,11 @@ class KerasPoisson:
                 # self.model.add(layers.Dense(1, activation="exponential"))
                 self.model.add(layers.Dense(4, activation="sigmoid"))
 
+                # per https://stats.stackexchange.com/questions/140061/how-to-set-up-neural-network-to-output-ordinal-data
+                # self.model.add(layers.Dense(1, use_bias=False))
+                # self.model.add(BiasLayer(4))
+                # self.model.add(layers.Activation("sigmoid"))
+
                 opt = optimizers.Adam(learning_rate=0.000001)
                 # initial_learning_rate = 0.1
                 # lr_schedule = optimizers.schedules.ExponentialDecay(
@@ -1432,7 +1502,12 @@ class KerasPoisson:
                     restore_best_weights=True,
                 )
                 self.model.compile(
-                    loss="binary_crossentropy",
+                    # loss="binary_crossentropy",
+                    # loss=losses.BinaryCrossentropy(label_smoothing=0.1),
+                    loss="mean_squared_error",
+                    # loss=mse_loss_for_classes,
+                    # loss=tfa.losses.SigmoidFocalCrossEntropy(),
+                    # above focal loss per https://www.tensorflow.org/addons/api_docs/python/tfa/losses/SigmoidFocalCrossEntropy
                     optimizer=opt,
                     metrics=[rmse_metric_for_classes],
                 )
@@ -1451,7 +1526,7 @@ class KerasPoisson:
                 self.train_X,  # just here because the function requires this argument
                 train["sid_shop_item_qty_sold_day"].to_numpy(),
                 dummy_regr_y_pred,
-                get_stats,
+                False,
             )
             print(f"Dummy regression RMSE is {dummy_regr_rmse}.")
 
@@ -1552,7 +1627,8 @@ class KerasPoisson:
             if get_stats:
 
                 s3_client = boto3.client("s3")
-                for m in ("poisson", "root_mean_squared_error"):
+                # for m in ("poisson", "root_mean_squared_error"):
+                for m in ("rmse_metric_for_classes",):
                     try:
                         plt.plot(history.history[m])
                         plt.plot(history.history[f"val_{m}"])
@@ -1561,11 +1637,16 @@ class KerasPoisson:
                         plt.title(f"Model {m.replace('_',' ').title()} Metric")
                         plt.ylabel(f"{m.replace('_',' ').title()}")
                         plt.xlabel("Epoch")
-                        left, right = plt.xlim()
+                        # left, right = plt.xlim()
+                        # plt.xticks(
+                        #     np.arange(left + 1, right + 2, step=1)
+                        # )  # Set tick locations.
+                        n_epochs = len(history.history[m])
                         plt.xticks(
-                            np.arange(left + 1, right + 2, step=1)
-                        )  # Set tick locations.
-                        plt.legend(["Train", "Test"], loc="upper left")
+                            np.arange(0, n_epochs, step=1),
+                            np.arange(1, n_epochs+1, step=1)
+                        )
+                        plt.legend(["Train", "Test"], loc="upper right")
 
                         png_fname = combined_counter + f"_{m}.png"
                         plt.savefig(png_fname)
@@ -1734,6 +1815,14 @@ def main():
     )
 
     parser.add_argument(
+        "--remove_sep15",
+        "-r",
+        help="remove Sep 2015 data from training (if included) or not (if not included)",
+        default=False,
+        action="store_true",
+    )
+
+    parser.add_argument(
         "--weather",
         "-w",
         help="whether to incorporate weather features (if included) or not (if not included)",
@@ -1888,7 +1977,7 @@ def main():
         f"Running Keras Poisson model with s3_path: {args.s3_path}, "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
         f"n_months_in_val_set: {args.n_months_in_val_set}, frac: {args.frac}, "
-        f"weather features: {args.weather}, "
+        f"remove_sep15: {args.remove_sep15}, weather features: {args.weather}, "
         f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
         f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}...",
     )
@@ -1901,6 +1990,7 @@ def main():
         args.n_months_in_val_set,
         args.pipe_steps,
         frac=args.frac,
+        remove_sep15_from_training=args.remove_sep15,
         add_weather_features=args.weather,
         # normalize_tx=args.normalize_tx,
         scaler=args.scaler,
