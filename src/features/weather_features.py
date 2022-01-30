@@ -12,11 +12,12 @@ from botocore.exceptions import ClientError
 from ec2_metadata import ec2_metadata
 import pandas as pd
 import psycopg2
+from psycopg2.sql import SQL, Identifier
 from sqlalchemy.types import Float, INTEGER
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
 
-from prep_time_series_data import (
+from features.prep_time_series_data import (
     _add_col_prefix,
     _downcast,
     _map_to_sql_dtypes,
@@ -25,6 +26,7 @@ from prep_time_series_data import (
 
 # Import the 'config' function from the config.py file
 from utils.config import config
+from utils.rds_db_commands import df_from_sql_table, df_from_sql_query
 from utils.rds_instance_mgmt import start_instance, stop_instance
 from utils.timer import Timer
 from utils.write_df_to_sql_table import psql_insert_copy, write_df_to_sql
@@ -579,7 +581,7 @@ def generate_features(stop_db=False):
                 logging.debug(f"cur.statusmessage is {cur.statusmessage}")
 
         # Make the changes to the database persistent
-        conn.commit()
+        # conn.commit()
 
         for line in conn.notices:
             logging.debug(line.strip("\n"))
@@ -594,6 +596,73 @@ def generate_features(stop_db=False):
 
     if stop_db:
         stop_instance()
+
+
+def get_weather_data(startdate, enddate, cat_cols, db_table_name="shop_dates_weather"):
+    # start DB instance
+    start_instance()
+
+    # get data out of the Postgres database
+    cast_dict = {
+        "shop_id": "uint8",
+        "sdw_elevation": "int16",
+        "sdw_distance": "float32",
+        "sdw_prcp": "uint16",
+        "sdw_tmax": "float32",
+        "sdw_tmin": "float32",
+        "sdw_only_neg_temp_ind": "uint8",
+        "sdw_only_pos_temp_ind": "uint8",
+        "sdw_tmin_diff_lag": "float32",
+        "sdw_tmax_diff_lag": "float32",
+        "sdw_tmin_diff_lead": "float32",
+        "sdw_tmax_diff_lead": "float32",
+        "sdw_prcp_diff_lag": "int16",
+        "sdw_prcp_diff_lead": "int16",
+        "sdw_days_w_prcp_last_7d": "uint8",
+        "sdw_total_prcp_last_7d": "int16",
+        "sdw_tmax_diff_lag7": "float32",
+        "sdw_tmax_diff_lag14": "float32",
+        "sdw_tmax_diff_lag21": "float32",
+    }
+    # df = df_from_sql_table(db_table_name, cast_dict, date_list=["sale_date"])
+
+    sql_str = (
+        "SELECT "
+        "{0} "
+        "FROM {1} "
+        "WHERE {2} >= %(start_dt)s AND {2} <= %(end_dt)s;"
+    )
+    sql = SQL(sql_str).format(
+        SQL(", ").join(
+            [
+                Identifier(col)
+                for col in list(cast_dict.keys()) + ['sale_date']
+            ]
+        ),
+        Identifier(db_table_name),
+        Identifier('sale_date'),
+    )
+    params = {"start_dt": startdate, "end_dt": enddate}
+    df = df_from_sql_query(sql, cast_dict, params=params, date_list=['sale_date'])
+
+    # subset to relevant columns
+    # df = df.filter(items=list(cast_dict.keys()) + ["sale_date"])
+
+    # rename binary columns to format consistent with other binary cols
+    bin_cols = ("sdw_only_neg_temp_ind", "sdw_only_pos_temp_ind")
+    last_bin_col_num = max(
+        [
+            int(x.split("_")[1])
+            for x in cat_cols
+        ]
+    )
+    rename_dict = {
+        col: f"cat_{i}_{col}"
+        for i, col in enumerate(bin_cols, last_bin_col_num + 1)
+    }
+    df.rename(rename_dict, axis=1, inplace=True)
+
+    return df
 
 
 def main():
