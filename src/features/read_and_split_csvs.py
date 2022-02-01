@@ -548,7 +548,7 @@ def train_test_time_split(
 
     # loop over however many train-validation splits need to be done
     logging.info("Starting loop over train-validation splits...")
-    for m in range(n_val_sets):
+    for train_counter, m in enumerate(range(n_val_sets), 1):
         # variable to hold processed validatiaon data
         processed_val_data = None
 
