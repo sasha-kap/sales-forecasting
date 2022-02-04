@@ -425,6 +425,10 @@ def train_test_time_split(
         train data dataframe
     processed_val_data_list : list of DataFrames
         list of validation data dataframes
+    train_counter : int
+        Counter of train-validation splits
+    last_val_set_ind : bool
+        Indicator of last train-validation set created inside the main loop
     """
     csv_list = list_csvs(startmonth)
     assert isinstance(csv_list, list), f"csv_list is not a list, but {type(csv_list)}!"
@@ -549,7 +553,7 @@ def train_test_time_split(
     # loop over however many train-validation splits need to be done
     logging.info("Starting loop over train-validation splits...")
     for train_counter, m in enumerate(range(n_val_sets), 1):
-        # variable to hold processed validatiaon data
+        # variable to hold processed validation data
         processed_val_data = None
 
         # identify CSV files that have not been read yet for train set and read them in
@@ -771,7 +775,9 @@ def train_test_time_split(
             f"{', '.join([str(Counter(df['sid_shop_item_qty_sold_day'])) for df in processed_val_data_list])}"
         )
 
-        yield accumulated_train_data, processed_val_data_list
+        last_val_set_ind = m == n_val_sets - 1
+
+        yield accumulated_train_data, processed_val_data_list, train_counter, last_val_set_ind
 
 
 def valid_date(s):
