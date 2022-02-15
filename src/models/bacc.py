@@ -75,7 +75,7 @@ class BACC(Metric):
             )
         ) / 2
 
-        return result
+        return result[0] if len(self.thresholds) == 1 else result
 
     def reset_states(self):
         num_thresholds = len(to_list(self.thresholds))
