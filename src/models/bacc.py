@@ -3,12 +3,12 @@ per https://stackoverflow.com/a/63494039/9987623
 """
 import numpy as np
 
-from tensorflow.python.keras import backend as K
-from tensorflow.python.keras.metrics import Metric
-from tensorflow.python.keras.utils import metrics_utils
-from tensorflow.python.ops import init_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.keras.utils.generic_utils import to_list
+import tensorflow as tf
+from keras.metrics import Metric
+from keras import backend
+from keras.metrics import Metric
+from keras.utils import metrics_utils
+from keras.utils.generic_utils import to_list
 
 
 class BACC(Metric):
@@ -24,6 +24,9 @@ class BACC(Metric):
         self.thresholds = metrics_utils.parse_init_thresholds(
             thresholds, default_threshold=default_threshold
         )
+
+        self._thresholds_distributed_evenly = (
+            metrics_utils.is_evenly_distributed_thresholds(self.thresholds))
         self.true_positives = self.add_weight(
             "true_positives",
             shape=(len(self.thresholds),),
@@ -46,17 +49,28 @@ class BACC(Metric):
         )
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-
+        """Accumulates true positive and false negative statistics.
+        Args:
+            y_true: The ground truth values, with the same dimensions as `y_pred`.
+            Will be cast to `bool`.
+            y_pred: The predicted values. Each element must be in the range `[0, 1]`.
+            sample_weight: Optional weighting of each example. Defaults to 1. Can be a
+            `Tensor` whose rank is either 0, or the same rank as `y_true`, and must
+            be broadcastable to `y_true`.
+        Returns:
+            Update op.
+        """
         return metrics_utils.update_confusion_matrix_variables(
             {
                 metrics_utils.ConfusionMatrix.TRUE_POSITIVES: self.true_positives,
+                metrics_utils.ConfusionMatrix.FALSE_NEGATIVES: self.false_negatives,
                 metrics_utils.ConfusionMatrix.TRUE_NEGATIVES: self.true_negatives,
                 metrics_utils.ConfusionMatrix.FALSE_POSITIVES: self.false_positives,
-                metrics_utils.ConfusionMatrix.FALSE_NEGATIVES: self.false_negatives,
             },
             y_true,
             y_pred,
             thresholds=self.thresholds,
+            thresholds_distributed_evenly=self._thresholds_distributed_evenly,
             top_k=self.top_k,
             class_id=self.class_id,
             sample_weight=sample_weight,
@@ -66,20 +80,27 @@ class BACC(Metric):
         """
         Returns the Balanced Accuracy (average between recall and specificity)
         """
-        result = (
-            math_ops.div_no_nan(
-                self.true_positives, self.true_positives + self.false_negatives
-            )
-            + math_ops.div_no_nan(
-                self.true_negatives, self.true_negatives + self.false_positives
-            )
-        ) / 2
+        result = tf.math.reduce_mean(
+            [
+                tf.math.divide_no_nan(
+                    self.true_positives, tf.math.add(self.true_positives, self.false_negatives)
+                ),
+                tf.math.divide_no_nan(
+                    self.true_negatives, tf.math.add(self.true_negatives, self.false_positives)
+                )
+            ],
+            axis=0,
+        )
 
         return result[0] if len(self.thresholds) == 1 else result
 
-    def reset_states(self):
+    def reset_state(self):
         num_thresholds = len(to_list(self.thresholds))
-        K.batch_set_value([(v, np.zeros((num_thresholds,))) for v in self.variables])
+        backend.batch_set_value([(v, np.zeros((num_thresholds,)))
+                             for v in (self.true_positives,
+                                       self.false_negatives,
+                                       self.true_negatives,
+                                       self.false_positives)])
 
     def get_config(self):
         config = {
