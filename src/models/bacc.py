@@ -4,7 +4,6 @@ per https://stackoverflow.com/a/63494039/9987623
 import numpy as np
 
 import tensorflow as tf
-from keras.metrics import Metric
 from keras import backend
 from keras.metrics import Metric
 from keras.utils import metrics_utils
@@ -25,27 +24,28 @@ class BACC(Metric):
             thresholds, default_threshold=default_threshold
         )
 
-        self._thresholds_distributed_evenly = (
-            metrics_utils.is_evenly_distributed_thresholds(self.thresholds))
+        self._thresholds_distributed_evenly = metrics_utils.is_evenly_distributed_thresholds(
+            self.thresholds
+        )
         self.true_positives = self.add_weight(
             "true_positives",
             shape=(len(self.thresholds),),
-            initializer=init_ops.zeros_initializer,
+            initializer=tf.compat.v1.zeros_initializer,
         )
         self.true_negatives = self.add_weight(
             "true_negatives",
             shape=(len(self.thresholds),),
-            initializer=init_ops.zeros_initializer,
+            initializer=tf.compat.v1.zeros_initializer,
         )
         self.false_positives = self.add_weight(
             "false_positives",
             shape=(len(self.thresholds),),
-            initializer=init_ops.zeros_initializer,
+            initializer=tf.compat.v1.zeros_initializer,
         )
         self.false_negatives = self.add_weight(
             "false_negatives",
             shape=(len(self.thresholds),),
-            initializer=init_ops.zeros_initializer,
+            initializer=tf.compat.v1.zeros_initializer,
         )
 
     def update_state(self, y_true, y_pred, sample_weight=None):
@@ -83,11 +83,13 @@ class BACC(Metric):
         result = tf.math.reduce_mean(
             [
                 tf.math.divide_no_nan(
-                    self.true_positives, tf.math.add(self.true_positives, self.false_negatives)
+                    self.true_positives,
+                    tf.math.add(self.true_positives, self.false_negatives),
                 ),
                 tf.math.divide_no_nan(
-                    self.true_negatives, tf.math.add(self.true_negatives, self.false_positives)
-                )
+                    self.true_negatives,
+                    tf.math.add(self.true_negatives, self.false_positives),
+                ),
             ],
             axis=0,
         )
@@ -96,11 +98,17 @@ class BACC(Metric):
 
     def reset_state(self):
         num_thresholds = len(to_list(self.thresholds))
-        backend.batch_set_value([(v, np.zeros((num_thresholds,)))
-                             for v in (self.true_positives,
-                                       self.false_negatives,
-                                       self.true_negatives,
-                                       self.false_positives)])
+        backend.batch_set_value(
+            [
+                (v, np.zeros((num_thresholds,)))
+                for v in (
+                    self.true_positives,
+                    self.false_negatives,
+                    self.true_negatives,
+                    self.false_positives,
+                )
+            ]
+        )
 
     def get_config(self):
         config = {
