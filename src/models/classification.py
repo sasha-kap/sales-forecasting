@@ -15,7 +15,6 @@ calculated with the predict() function
 TO DO:
 - Update stop_instance function to allow for it to be run in the background
 with threading (https://stackoverflow.com/questions/7168508/background-function-in-python)
-- move s3 upload_file() segments into a function
 
 DECIDED TO SKIP FOR NOW:
 - Update validation data specification in the model fit() method to accept
@@ -57,9 +56,11 @@ from sklearn.preprocessing import (
     RobustScaler,
     StandardScaler,
 )
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import (
+
+# import tensorflow as tf
+# from tensorflow import keras
+from keras import (
+    backend,
     callbacks,
     initializers,
     layers,
@@ -67,6 +68,7 @@ from tensorflow.keras import (
     metrics,
     optimizers,
 )
+from keras import Sequential
 import tensorflow_addons as tfa
 
 sys.path.insert(1, os.path.join(sys.path[0], ".."))
@@ -77,6 +79,100 @@ from features.read_and_split_csvs import (
     valid_frac,
 )
 from models.bacc import BACC
+
+
+class EarlyStoppingAtMaxBACC(callbacks.Callback):
+    """Stop training when the balanced accuracy is at its max.
+
+    Parameters:
+    -----------
+        total_epochs: number of epochs to train the model,
+        as specified in the fit() method
+
+        thresh_list: list of float values to be used as decision threshold.
+
+        patience: Number of epochs to wait after max has been hit. After this
+        number of no improvement, training stops.
+  """
+
+    def __init__(self, total_epochs, thresh_list, patience=0):
+        super(EarlyStoppingAtMaxBACC, self).__init__()
+        self.total_epochs = total_epochs
+        self.thresh_list = thresh_list
+        self.patience = patience
+        # best_weights to store the weights at which the maximum BACC occurs.
+        self.best_weights = None
+
+    def on_train_begin(self, logs=None):
+        # The number of epoch it has waited when metric is no longer maximum.
+        self.wait = 0
+        # The epoch the training stops at.
+        self.stopped_epoch = 0
+        # Initialize the best metric value as negative infinity.
+        self.best_metric = np.NINF
+
+    def on_epoch_end(self, epoch, logs=None):
+        current = max(logs.get("val_balanced_acc"))
+        thr = self.thresh_list[np.argmax(logs.get("val_balanced_acc"))]
+        if np.greater(current, self.best_metric):
+            self.best_metric = current
+            self.best_thr = thr
+            self.wait = 0
+            # Record the best weights if current results is better (larger).
+            self.best_weights = self.model.get_weights()
+            # Record the number of the best epoch
+            self.best_epoch = epoch + 1
+            # if best epoch is the last possible epoch
+            if (epoch + 1) == self.total_epochs:
+                self.stopped_epoch = 0
+        else:
+            self.wait += 1
+            # if stopping training after no improvement for 'patience' epochs
+            if self.wait >= self.patience:
+                self.stopped_epoch = epoch
+                self.model.stop_training = True
+                print("Restoring model weights from the end of the best epoch.")
+                self.model.set_weights(self.best_weights)
+            # if stopping training because of the total epochs limit
+            elif (epoch + 1) == self.total_epochs:
+                self.stopped_epoch = 0
+                print("Restoring model weights from the end of the best epoch.")
+                self.model.set_weights(self.best_weights)
+
+    def on_train_end(self, logs=None):
+        if self.stopped_epoch > 0:
+            print(
+                f"Training finished after no improvement for {self.patience} epochs - "
+                f"best epoch: {self.best_epoch}, "
+                f"best threshold: {self.best_thr}, "
+                f"best validation BACC: {self.best_metric}."
+            )
+        else:
+            # if best epoch is the last epoch or patience was not reached
+            # due to the total epochs limit being reached first
+            print(
+                f"Training finished on the last possible epoch - "
+                f"best epoch: {self.best_epoch}, "
+                f"best threshold: {self.best_thr}, "
+                f"best validation BACC: {self.best_metric}."
+            )
+
+
+class AddParamsToLogs(callbacks.Callback):
+    """
+    Based on https://stackoverflow.com/questions/48488549/keras-append-to-logs-from-callback
+    Just remember to place this callback before CSVLogger in your fit call.
+    """
+
+    def __init__(self, hyperparams, counter):
+        super(AddParamsToLogs, self).__init__()
+        self.hyperparams = hyperparams
+        self.counter = counter
+
+    def on_epoch_end(self, epoch, logs):
+        logs["train_params_counter"] = self.counter
+        for k in self.hyperparams.keys():
+            logs[k] = self.hyperparams[k]
 
 
 class KerasClf:
@@ -96,6 +192,8 @@ class KerasClf:
         effect_coding=False,
         add_princomps=0,
         add_interactions=False,
+        stats_only_for_one_param_comb=False,
+        val_set_needing_stats="all",
     ):
         self.curr_dt_time = curr_dt_time
         self.startmonth = startmonth
@@ -111,6 +209,8 @@ class KerasClf:
         self.effect_coding = effect_coding
         self.add_princomps = add_princomps
         self.add_interactions = add_interactions
+        self.stats_only_for_one_param_comb = stats_only_for_one_param_comb
+        self.val_set_needing_stats = val_set_needing_stats
 
         self.non_x_cols = [
             "shop_id",
@@ -125,19 +225,41 @@ class KerasClf:
             )
 
         self.params = {
-            "loss": ["binary_crossentropy"],
-            "learning_rate": [0.001],
-            "batch_size": [64],
-            "epochs": [50],
-            "threshold": [0.5],
+            "gamma": [
+                0.0,
+                2.0,
+            ],  # When gamma=0, binary focal crossentropy is equivalent to the binary crossentropy loss.
+            "label_smoothing": [0.0, 0.01, 0.05],
+            "learning_rate": [0.0003],
+            "batch_size": [2048],
+            "epochs": [75],
+            "threshold": [list(np.linspace(0, 1, num=200, endpoint=False))],
+            "bias_initializer": ["default", "compute"],
+            "class_weight": [None, "compute"],
+            "sample_weight": [None, 7, 14, 21],
         }
         assert all(
             [isinstance(v, list) for v in self.params.values()]
         ), "Values provided for each hyperparameter must be enclosed in a list."
+        assert all(
+            [v in ("default", "compute",) for v in self.params["bias_initializer"]]
+        ), "Allowed bias_initializer values are 'default' and 'compute'."
+        assert all(
+            [v in (None, "compute",) for v in self.params["class_weight"]]
+        ), "Allowed class_weight values are None and 'compute'."
+        assert all(
+            [v is None or isinstance(v, int) for v in self.params["sample_weight"]]
+        ), "Allowed sample_weight values are None and integers."
         logging.info(
             "Model parameters used: "
             + ", ".join([f"{k}: {v}" for k, v in self.params.items()])
         )
+
+        self.value_map_for_logging = {
+            "bias_initializer": {"default": 0, "compute": 1},
+            "class_weight": {None: 0, "compute": 1},
+            "sample_weight": {None: 0},
+        }
 
         # determine if there is more than one combination of hyperparameters
         # if only one combination, set get_stats_ flag to True
@@ -149,9 +271,33 @@ class KerasClf:
         metric_names = ("balanced acc", "recall", "precision", "F1 score")
         self.clf_metrics = dict(zip(metric_names, metric_fns))
 
+    def which_stats_to_get(self, first_val_set_ind, last_val_set_ind):
+
+        if self.stats_only_for_one_param_comb:
+            if self.get_stats_:
+                if self.val_set_needing_stats == "first":
+                    get_stats = first_val_set_ind
+                elif self.val_set_needing_stats == "last":
+                    get_stats = last_val_set_ind
+                else:
+                    get_stats = True  # get stats for every validation set (default)
+            else:
+                get_stats = False
+        else:
+            if self.val_set_needing_stats == "first":
+                get_stats = first_val_set_ind
+            elif self.val_set_needing_stats == "last":
+                get_stats = last_val_set_ind
+            else:
+                get_stats = True  # get stats for every validation set (default)
+
+        return get_stats
+
     def gridsearch_wfv(self):
 
         self.all_params_combs = list()
+
+        self.training_log = f"training_log_{self.curr_dt_time}.log"
 
         for train, test, train_counter, last_val_set_ind in train_test_time_split(
             self.startmonth,
@@ -164,10 +310,9 @@ class KerasClf:
             add_weather_features=self.add_weather_features,
         ):
 
-            if self.get_stats_:
-                get_stats = last_val_set_ind
-            else:
-                get_stats = False
+            first_val_set_ind = train_counter == 1
+
+            get_stats = self.which_stats_to_get(first_val_set_ind, last_val_set_ind)
 
             self.train_counter = train_counter
 
@@ -214,12 +359,12 @@ class KerasClf:
                 key = f"keras_all_params_combs_{self.curr_dt_time}.csv"
                 # global s3_client
                 s3_client = boto3.client("s3")
-                response = s3_client.upload_file(output_csv, "sales-demand-data", key)
+                _ = s3_client.upload_file(output_csv, "clf-model-0218", key)
                 logging.info(
                     "Name of CSV uploaded to S3 and containing all parameter combinations "
                     f"and results is: {key}"
                 )
-            except ClientError as e:
+            except ClientError:
                 logging.exception(
                     "CSV file with Keras parameter combinations and results was not copied to S3."
                 )
@@ -229,7 +374,43 @@ class KerasClf:
                 "List of parameter-result dictionaries is empty and was not converted to CSV!"
             )
 
+        log_file = Path(self.training_log)
+        # if training log file exists (epoch-level parameter-results log file)
+        if log_file.is_file():
+            try:
+                # global s3_client
+                s3_client = boto3.client("s3")
+                _ = s3_client.upload_file(
+                    self.training_log, "clf-model-0218", self.training_log
+                )
+                logging.info(
+                    "Name of log file uploaded to S3 and containing all parameter combinations "
+                    f"and results at epoch level is: {key}"
+                )
+            except ClientError:
+                logging.exception(
+                    "Log file with epoch-level parameter combinations and results was not copied to S3."
+                )
+        else:
+            logging.debug(
+                "Log file with epoch-level parameter combinations and results was "
+                "not found and not copied to S3."
+            )
+
     def preprocess_features(self, train_X, test_X):
+        steps_list = [
+            step for step in self.params["sample_weight"] if isinstance(step, int)
+        ]
+        if steps_list:
+            days_before_last_day = (
+                train_X["sale_date"].max() - train_X["sale_date"]
+            ).dt.days
+            self.sample_weights_dict = dict()
+            for step in steps_list:
+                weights = np.exp((-days_before_last_day // step) / 75).to_numpy()
+                self.sample_weights_dict[step] = weights
+            del days_before_last_day
+
         train_X.drop(self.non_x_cols, axis=1, inplace=True)
         train_X.reset_index(drop=True, inplace=True)
         test_X.drop(self.non_x_cols, axis=1, inplace=True)
@@ -401,23 +582,20 @@ class KerasClf:
             1,
         ):
 
-            # self.params_comb_dict = params_comb_dict.copy()
-            # self.params_comb_dict["precision_list_"] = list()
-            # self.params_comb_dict["precision_thresh_list_"] = list()
-            # self.params_comb_dict["recall_list_"] = list()
-            # self.params_comb_dict["recall_thresh_list_"] = list()
-            # self.params_comb_dict["F1_score_list_"] = list()
-            # self.params_comb_dict["F1_score_thresh_list_"] = list()
-            # self.params_comb_dict["balanced_acc_list_"] = list()
-            # self.params_comb_dict["balanced_acc_thresh_list_"] = list()
-            # self.params_comb_dict["fit_times_list_"] = list()
-            # self.params_comb_dict["counter_"] = list()
             self.params_comb_dict = defaultdict(list, params_comb_dict)
+
+            combined_counter = "_" + "_".join(
+                [str(self.train_counter).zfill(2), str(params_comb_counter).zfill(2)]
+            )
+            self.params_comb_dict["counter_"].append(combined_counter)
+
+            combined_counter_num = float(combined_counter[1:].replace("_", "."))
 
             print(f"Shape of train_X is {self.train_X.shape}")
 
             try:
-                self.model = keras.Sequential()
+                # self.model = keras.Sequential()
+                self.model = Sequential()
 
                 layer_size = (
                     2 ** (round(np.log(self.train_X.shape[1]) / np.log(2))) // 2
@@ -433,7 +611,7 @@ class KerasClf:
                         activation="relu",
                     )
                 )
-                # self.model.add(layers.BatchNormalization())
+                self.model.add(layers.BatchNormalization())
                 # self.model.add(layers.Dropout(0.2))
                 self.model.add(layers.Dense(layer_size, activation="relu"))
                 # self.model.add(layers.Dropout(0.2))
@@ -451,11 +629,26 @@ class KerasClf:
                 # self.model.add(
                 #     layers.Activation("exponential")
                 # )  # need to specify number of nodes?
-                # self.model.add(layers.BatchNormalization())
-                self.model.add(layers.Dense(1, activation="sigmoid"))
+                self.model.add(layers.BatchNormalization())
+
+                neg, pos = np.bincount(self.train_y)
+                total = neg + pos
+                if params_comb_dict["bias_initializer"] == "default":
+                    bias_initializer = "zeros"
+                elif params_comb_dict["bias_initializer"] == "compute":
+                    output_bias = np.log([pos / neg])
+                    bias_initializer = initializers.Constant(output_bias)
+                self.model.add(
+                    layers.Dense(
+                        1, activation="sigmoid", bias_initializer=bias_initializer
+                    )
+                )
                 # self.model.add(layers.Dense(1))
 
-                opt = optimizers.Adam(learning_rate=params_comb_dict["learning_rate"])
+                # opt = optimizers.Adam(learning_rate=params_comb_dict["learning_rate"])
+                opt = optimizers.adam_v2.Adam(
+                    learning_rate=params_comb_dict["learning_rate"]
+                )
                 # initial_learning_rate = 0.1
                 # lr_schedule = optimizers.schedules.ExponentialDecay(
                 #     initial_learning_rate,
@@ -465,16 +658,42 @@ class KerasClf:
                 # )
                 # opt = optimizers.SGD(learning_rate=lr_schedule, momentum=0.9)
                 # opt = optimizers.SGD(learning_rate=0.001, momentum=0.9)
-                callback = callbacks.EarlyStopping(
-                    monitor="val_f1_score",
-                    patience=10,
-                    mode="max",
-                    restore_best_weights=True,
-                )
+                # callback = callbacks.EarlyStopping(
+                #     monitor="val_f1_score",
+                #     patience=10,
+                #     mode="max",
+                #     restore_best_weights=True,
+                # )
+                if params_comb_dict["gamma"] == 0.0:
+                    loss = losses.BinaryCrossentropy(
+                        label_smoothing=params_comb_dict["label_smoothing"]
+                    )
+                else:
+                    loss = losses.BinaryFocalCrossentropy(
+                        gamma=params_comb_dict["gamma"],
+                        label_smoothing=params_comb_dict["label_smoothing"],
+                    )
+
                 self.model.compile(
-                    loss=params_comb_dict["loss"],
+                    loss=loss,
+                    # loss=losses.BinaryFocalCrossentropy(
+                    #     gamma=params_comb_dict["gamma"],
+                    #     label_smoothing=params_comb_dict["label_smoothing"],
+                    # ),
                     optimizer=opt,
                     metrics=[
+                        metrics.TruePositives(
+                            thresholds=params_comb_dict["threshold"], name="tp",
+                        ),
+                        metrics.FalsePositives(
+                            thresholds=params_comb_dict["threshold"], name="fp",
+                        ),
+                        metrics.TrueNegatives(
+                            thresholds=params_comb_dict["threshold"], name="tn",
+                        ),
+                        metrics.FalseNegatives(
+                            thresholds=params_comb_dict["threshold"], name="fn",
+                        ),
                         metrics.Recall(
                             thresholds=params_comb_dict["threshold"],
                             name="recall_score",
@@ -484,14 +703,14 @@ class KerasClf:
                             name="precision_score",
                         ),
                         tfa.metrics.F1Score(
-                            num_classes=1,
-                            threshold=params_comb_dict["threshold"],
-                            name="f1_score",
+                            num_classes=1, threshold=0.5, name="f1_score",
                         ),
                         BACC(
                             thresholds=params_comb_dict["threshold"],
                             name="balanced_acc",
                         ),
+                        metrics.AUC(name="auc"),
+                        metrics.AUC(name="prc", curve="PR"),  # precision-recall curve
                     ],
                 )
 
@@ -512,6 +731,43 @@ class KerasClf:
                     f"{name} for dummy classifier always predicting the "
                     f"minority class is {dummy_clf_metric}."
                 )
+            del dummy_clf_y_pred
+
+            class_weight = None
+            if params_comb_dict["class_weight"] == "compute":
+                # Scaling by total/2 helps keep the loss to a similar magnitude.
+                # The sum of the weights of all examples stays the same.
+                weight_for_0 = (1 / neg) * (total / 2.0)
+                weight_for_1 = (1 / pos) * (total / 2.0)
+
+                class_weight = {0: weight_for_0, 1: weight_for_1}
+
+                print(f"Weight for class 0: {weight_for_0:.2f}")
+                print(f"Weight for class 1: {weight_for_1:.2f}")
+
+            if not params_comb_dict["sample_weight"]:
+                sample_weight = None
+            else:
+                sample_weight = self.sample_weights_dict[
+                    params_comb_dict["sample_weight"]
+                ]
+
+            csv_logger = callbacks.CSVLogger(self.training_log, append=True)
+
+            params_to_log = params_comb_dict.copy()
+            params_to_log["threshold_min"] = round(min(params_to_log["threshold"]), 2)
+            params_to_log["threshold_max"] = round(max(params_to_log["threshold"]), 2)
+            params_to_log["threshold_step"] = round(
+                params_to_log["threshold"][1] - params_to_log["threshold"][0], 3
+            )
+            del params_to_log["threshold"]
+
+            params_to_log = {
+                k: self.value_map_for_logging[k][v]
+                if k in self.value_map_for_logging and v in self.value_map_for_logging[k]
+                else v
+                for k, v in params_to_log.items()
+            }
 
             start_time = time.perf_counter()
             history = self.model.fit(
@@ -521,7 +777,17 @@ class KerasClf:
                 epochs=params_comb_dict["epochs"],
                 batch_size=params_comb_dict["batch_size"],
                 shuffle=True,
-                callbacks=[callback],
+                callbacks=[
+                    AddParamsToLogs(params_to_log, combined_counter_num),
+                    EarlyStoppingAtMaxBACC(
+                        params_comb_dict["epochs"],
+                        params_comb_dict["threshold"],
+                        patience=10,
+                    ),
+                    csv_logger,
+                ],
+                class_weight=class_weight,
+                sample_weight=sample_weight,
                 verbose=2,
             )
 
@@ -541,10 +807,7 @@ class KerasClf:
                     best_threshold
                 )
 
-            combined_counter = "_" + "_".join(
-                [str(params_comb_counter).zfill(2), str(self.train_counter).zfill(2)]
-            )
-            self.params_comb_dict["counter_"].append(combined_counter)
+            del pred_probs
 
             if get_stats:
 
@@ -555,33 +818,46 @@ class KerasClf:
                     "f1_score",
                     "balanced_acc",
                 ):
+                    # if metric values are arrays of values for different thresholds,
+                    # plot the maximum values from each array
+                    if isinstance(history.history[m][0], np.ndarray):
+                        train_vls_to_plot = [np.max(a) for a in history.history[m]]
+                        test_vls_to_plot = [
+                            np.max(a) for a in history.history[f"val_{m}"]
+                        ]
+                    # if metric values are scalars, plot the values as-is
+                    else:
+                        train_vls_to_plot = history.history[m]
+                        test_vls_to_plot = history.history[f"val_{m}"]
+
+                    plt.plot(train_vls_to_plot)
+                    plt.plot(test_vls_to_plot)
+                    plt.title(f"Model {m.replace('_',' ').title()} Metric")
+                    plt.ylabel(f"{m.replace('_',' ').title()}")
+                    plt.xlabel("Epoch")
+                    n_epochs = len(history.history[m])
+                    plt.xticks(
+                        np.arange(0, n_epochs, step=1),
+                        np.arange(1, n_epochs + 1, step=1),
+                    )
+                    plt.legend(["Train", "Test"], loc="upper right")
+
+                    png_fname = combined_counter + f"_{m}.png"
+                    plt.savefig(png_fname)
+                    plt.clf()  # clear current figure
+
                     try:
-                        plt.plot(history.history[m])
-                        plt.plot(history.history[f"val_{m}"])
-                        plt.title(f"Model {m.replace('_',' ').title()} Metric")
-                        plt.ylabel(f"{m.replace('_',' ').title()}")
-                        plt.xlabel("Epoch")
-                        n_epochs = len(history.history[m])
-                        plt.xticks(
-                            np.arange(0, n_epochs, step=1),
-                            np.arange(1, n_epochs + 1, step=1),
-                        )
-                        plt.legend(["Train", "Test"], loc="upper right")
-
-                        png_fname = combined_counter + f"_{m}.png"
-                        plt.savefig(png_fname)
-                        plt.clf()  # clear current figure
                         key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
-                        response = s3_client.upload_file(
-                            png_fname, "sales-demand-data", key
-                        )
+                        _ = s3_client.upload_file(png_fname, "clf-model-0218", key)
 
-                    except ClientError as e:
+                    except ClientError:
                         logging.exception(
                             f"PNG file with learning curve for {combined_counter} "
                             f"parameter-fold combination "
                             f"and {m} metric was not copied to S3."
                         )
+
+            del history
 
             # (initially, check if list contains anything or is empty)
             # first, check if the master list of dictionaries contains a
@@ -632,10 +908,20 @@ class KerasClf:
                 f"{dict_key_val_str}."
             )
 
+            # With `clear_session()` called at the beginning,
+            # Keras starts with a blank state at each iteration
+            # and memory consumption is constant over time.
+            backend.clear_session()
+
     def predict(self, batch_size):
         return self.model.predict(self.test_X, batch_size=batch_size,)
 
-    def best_thresh(self, metric_fn, pred_probs, thresholds=np.arange(0, 1, 0.005)):
+    def best_thresh(
+        self,
+        metric_fn,
+        pred_probs,
+        thresholds=np.linspace(0, 1, num=200, endpoint=False),
+    ):
 
         # evaluate each threshold
         scores = [
@@ -751,7 +1037,10 @@ def main():
     parser.add_argument(
         "--add_princomps",
         "-c",
-        help="create specified number of additional principal component features (if included), or not (if not included)",
+        help=(
+            "create specified number of additional principal component features "
+            "(if included), or not (if not included)"
+        ),
         default="0",
         type=int,
     )
@@ -762,6 +1051,25 @@ def main():
         help="create interaction features (if included) or not (if not included)",
         default=False,
         action="store_true",
+    )
+
+    parser.add_argument(
+        "--stats_only_for_one_param_comb",
+        "-o",
+        help=(
+            "run evaluation metric code only if there is only one combination "
+            "of hyperparameters (if included) or not (if not included)"
+        ),
+        default=False,
+        action="store_true",
+    )
+
+    parser.add_argument(
+        "--val_set_needing_stats",
+        "-n",
+        help="validation set needing evaluation metrics (optionaL, default: all)",
+        default="all",
+        choices=["all", "first", "last"],
     )
 
     args = parser.parse_args()
@@ -804,7 +1112,7 @@ def main():
     logging.getLogger("botocore").setLevel(logging.CRITICAL)
     logging.getLogger("s3transfer").setLevel(logging.CRITICAL)
     logging.getLogger("urllib3").setLevel(logging.CRITICAL)
-    logging.getLogger("awswrangler").setLevel(logging.DEBUG)
+    logging.getLogger("matplotlib").setLevel(logging.CRITICAL)
 
     # # Check if code is being run on EC2 instance (vs locally)
     my_user = os.environ.get("USER")
@@ -837,8 +1145,6 @@ def main():
     logging.info(f"The sklearn version is {sk_version}.")
     logging.info(f"The tensorflow version is {tf_version}.")
 
-    s3_client = boto3.client("s3")
-
     logging.info(
         f"Running Keras classification model with "
         f"startmonth: {args.startmonth}, n_months_in_first_train_set: {args.n_months_in_first_train_set}, "
@@ -847,7 +1153,9 @@ def main():
         f"class_ratio: {args.class_ratio}, "
         f"n_val_sets_in_one_month: {args.n_val_sets_in_one_month}, "
         f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
-        f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}...",
+        f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}, "
+        f"stats_only_for_one_param_comb: {args.stats_only_for_one_param_comb}, "
+        f"val_set_needing_stats: {args.val_set_needing_stats}...",
     )
 
     model = KerasClf(
@@ -865,15 +1173,16 @@ def main():
         effect_coding=args.effect_coding,
         add_princomps=args.add_princomps,
         add_interactions=args.add_interactions,
+        stats_only_for_one_param_comb=args.stats_only_for_one_param_comb,
+        val_set_needing_stats=args.val_set_needing_stats,
     )
     model.gridsearch_wfv()
 
     # copy log file to S3 bucket
+    s3_client = boto3.client("s3")
     try:
-        response = s3_client.upload_file(
-            f"./logs/{log_fname}", "my-ec2-logs", log_fname
-        )
-    except ClientError as e:
+        _ = s3_client.upload_file(f"./logs/{log_fname}", "my-ec2-logs", log_fname)
+    except ClientError:
         logging.exception("Log file was not copied to S3.")
 
 
