@@ -605,7 +605,9 @@ def train_test_time_split(
                 ),
             ):
                 preprocessed_chunk, cat_col_name_dict = preprocess_chunk(
-                    chunk.sort_values(by=["shop_id", "item_id", "sale_date"]),
+                    chunk.sort_values(
+                        by=["shop_id", "item_id", "sale_date"]
+                    ),
                     null_col_dict,
                     index,
                     cat_col_name_dict,
@@ -647,6 +649,15 @@ def train_test_time_split(
             cols_to_drop = [
                 col for col in weather_df.columns.tolist() if col not in ("shop_id", "sale_date")
             ]
+            # accumulated_train_data.drop(
+            #     cols_to_drop,
+            #     axis=1,
+            #     inplace=True,
+            #     errors='ignore', # this is needed before the first merge with weather_df
+            # )
+            # accumulated_train_data = accumulated_train_data.merge(
+            #     weather_df, on=["shop_id", "sale_date"], how="left",
+            # )
             accumulated_train_data = accumulated_train_data.drop(
                 cols_to_drop,
                 axis=1,
@@ -654,10 +665,17 @@ def train_test_time_split(
             ).merge(weather_df, on=["shop_id", "sale_date"], how="left",)
 
         # check that only 1's and 0's are in the target column in train dataset
-        if not np.array_equal(
-            accumulated_train_data["sid_shop_item_qty_sold_day"].unique(),
-            np.array([0, 1]),
-        ):
+        # if not np.array_equal(
+        #     accumulated_train_data["sid_shop_item_qty_sold_day"].unique(),
+        #     np.array([0, 1]),
+        # ):
+        if not pd.Series(
+            accumulated_train_data["sid_shop_item_qty_sold_day"].unique()
+        ).isin([0,1]).all():
+            # print(
+            #     f"Target column in train data has some extraneous values: "
+            #     f"{Counter(accumulated_train_data['sid_shop_item_qty_sold_day'])}."
+            # )
             logging.debug(
                 f"Target column in train data has some extraneous values: "
                 f"{Counter(accumulated_train_data['sid_shop_item_qty_sold_day'])}."
@@ -763,6 +781,7 @@ def train_test_time_split(
         # specified number of chunks
         if n_val_sets_in_one_month > 1:
             shuffled_val_data = processed_val_data.sample(frac=1).reset_index(drop=True)
+            del processed_val_data
             processed_val_data_list = np.array_split(
                 shuffled_val_data, n_val_sets_in_one_month
             )
@@ -982,7 +1001,7 @@ def main():
                 f"n_val_sets_in_one_month: {args.n_val_sets_in_one_month}, "
                 f"weather: {args.weather}..."
             )
-            train_test_time_split(
+            for train, test, train_counter, last_val_set_ind in train_test_time_split(
                 args.startmonth,
                 args.n_months_in_first_train_set,
                 args.n_months_in_val_set,
@@ -991,7 +1010,16 @@ def main():
                 chunksize=args.chunksize,
                 frac=args.frac,
                 add_weather_features=args.weather,
-            )
+            ):
+                first_val_set_ind = train_counter == 1
+                test = test[0]
+                print(
+                    f"train_counter: {train_counter} iteration done: "
+                    f"first_val_set_ind: {first_val_set_ind}, "
+                    f"last_val_set_ind: {last_val_set_ind}, "
+                    f"shape of test df: {test.shape}.",
+                    flush=True,
+                )
 
         # copy log file to S3 bucket
         try:
