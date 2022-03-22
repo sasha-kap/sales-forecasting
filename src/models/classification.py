@@ -81,6 +81,124 @@ from features.read_and_split_csvs import (
 from models.bacc import BACC
 
 
+# class ReduceLROnPlateauByBACC(callbacks.ReduceLROnPlateau):
+class ReduceLROnPlateauByBACC(callbacks.Callback):
+    # def __init__(self):
+    #     # factor=0.1,
+    #     # patience=10,
+    #     # verbose=0,
+    #     # mode='auto',
+    #     # min_delta=1e-4,
+    #     # cooldown=0,
+    #     # min_lr=0,
+    #     super(ReduceLROnPlateauByBACC, self).__init__(
+    #         monitor="val_balanced_acc",
+    #         factor=0.5,
+    #         patience=10,
+    #         verbose=1,
+    #         mode="max",
+    #         min_delta=0.0,
+    #     )
+    def __init__(
+        self,
+        monitor="val_balanced_acc",
+        factor=0.1,
+        patience=7,
+        verbose=1,
+        mode="max",
+        min_delta=0.0,
+        cooldown=0,
+        min_lr=0,
+        **kwargs,
+    ):
+        super(ReduceLROnPlateauByBACC, self).__init__()
+
+        self.monitor = monitor
+        if factor >= 1.0:
+            raise ValueError(
+                f'ReduceLROnPlateau does not support a factor >= 1.0. Got {factor}'
+            )
+        if 'epsilon' in kwargs:
+            min_delta = kwargs.pop('epsilon')
+            logging.warning(
+                '`epsilon` argument is deprecated and '
+                'will be removed, use `min_delta` instead.'
+            )
+        self.factor = factor
+        self.min_lr = min_lr
+        self.min_delta = min_delta
+        self.patience = patience
+        self.verbose = verbose
+        self.cooldown = cooldown
+        self.cooldown_counter = 0  # Cooldown counter.
+        self.wait = 0
+        self.best = 0
+        self.mode = mode
+        self.monitor_op = None
+        self._reset()
+
+    def _reset(self):
+        """Resets wait counter and cooldown counter.
+        """
+        if self.mode not in ['auto', 'min', 'max']:
+            logging.warning(
+                'Learning rate reduction mode %s is unknown, '
+                'fallback to auto mode.', self.mode
+            )
+            self.mode = 'auto'
+        if (self.mode == 'min' or (self.mode == 'auto' and 'acc' not in self.monitor)):
+            self.monitor_op = lambda a, b: np.less(a, b - self.min_delta)
+            self.best = np.Inf
+        else:
+            self.monitor_op = lambda a, b: np.greater(a, b + self.min_delta)
+            self.best = -np.Inf
+        self.cooldown_counter = 0
+        self.wait = 0
+
+    def on_train_begin(self, logs=None):
+        self._reset()
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        logs["lr"] = backend.get_value(self.model.optimizer.lr)
+        current = max(logs.get(self.monitor))
+        if current is None:
+            logging.warning(
+                "Learning rate reduction is conditioned on metric `%s` "
+                "which is not available. Available metrics are: %s",
+                self.monitor,
+                ",".join(list(logs.keys())),
+            )
+
+        else:
+            if self.in_cooldown():
+                self.cooldown_counter -= 1
+                self.wait = 0
+
+            if self.monitor_op(current, self.best):
+                self.best = current
+                self.wait = 0
+            elif not self.in_cooldown():
+                self.wait += 1
+                if self.wait >= self.patience:
+                    old_lr = backend.get_value(self.model.optimizer.lr)
+                    if old_lr > np.float32(self.min_lr):
+                        new_lr = old_lr * self.factor
+                        new_lr = max(new_lr, self.min_lr)
+                        backend.set_value(self.model.optimizer.lr, new_lr)
+                        if self.verbose > 0:
+                            print(
+                                f"Learning rate will be reduced after epoch "
+                                f"{epoch+1} to {new_lr}.",
+                                flush=True,
+                            )
+                        self.cooldown_counter = self.cooldown
+                        self.wait = 0
+
+    def in_cooldown(self):
+        return self.cooldown_counter > 0
+
+
 class EarlyStoppingAtMaxBACC(callbacks.Callback):
     """Stop training when the balanced accuracy is at its max.
 
@@ -131,12 +249,12 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
             if self.wait >= self.patience:
                 self.stopped_epoch = epoch
                 self.model.stop_training = True
-                print("Restoring model weights from the end of the best epoch.")
+                print("Restoring model weights from the end of the best epoch.", flush=True)
                 self.model.set_weights(self.best_weights)
             # if stopping training because of the total epochs limit
             elif (epoch + 1) == self.total_epochs:
                 self.stopped_epoch = 0
-                print("Restoring model weights from the end of the best epoch.")
+                print("Restoring model weights from the end of the best epoch.", flush=True)
                 self.model.set_weights(self.best_weights)
 
     def on_train_end(self, logs=None):
@@ -145,7 +263,8 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
                 f"Training finished after no improvement for {self.patience} epochs - "
                 f"best epoch: {self.best_epoch}, "
                 f"best threshold: {self.best_thr}, "
-                f"best validation BACC: {self.best_metric}."
+                f"best validation BACC: {self.best_metric}.",
+                flush=True,
             )
         else:
             # if best epoch is the last epoch or patience was not reached
@@ -154,7 +273,8 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
                 f"Training finished on the last possible epoch - "
                 f"best epoch: {self.best_epoch}, "
                 f"best threshold: {self.best_thr}, "
-                f"best validation BACC: {self.best_metric}."
+                f"best validation BACC: {self.best_metric}.",
+                flush=True,
             )
 
 
@@ -226,17 +346,17 @@ class KerasClf:
 
         self.params = {
             "gamma": [
-                0.0,
+                # 0.0,
                 2.0,
             ],  # When gamma=0, binary focal crossentropy is equivalent to the binary crossentropy loss.
-            "label_smoothing": [0.0, 0.01, 0.05],
-            "learning_rate": [0.0003],
+            "label_smoothing": [0.0],
+            "learning_rate": [0.003],
             "batch_size": [2048],
-            "epochs": [75],
+            "epochs": [120],
             "threshold": [list(np.linspace(0, 1, num=200, endpoint=False))],
-            "bias_initializer": ["default", "compute"],
-            "class_weight": [None, "compute"],
-            "sample_weight": [None, 7, 14, 21],
+            "bias_initializer": ["compute"],
+            "class_weight": ["compute"],
+            "sample_weight": [14],
         }
         assert all(
             [isinstance(v, list) for v in self.params.values()]
@@ -411,6 +531,7 @@ class KerasClf:
                 self.sample_weights_dict[step] = weights
             del days_before_last_day
 
+        train_X = train_X.copy()
         train_X.drop(self.non_x_cols, axis=1, inplace=True)
         train_X.reset_index(drop=True, inplace=True)
         test_X.drop(self.non_x_cols, axis=1, inplace=True)
@@ -591,7 +712,7 @@ class KerasClf:
 
             combined_counter_num = float(combined_counter[1:].replace("_", "."))
 
-            print(f"Shape of train_X is {self.train_X.shape}")
+            print(f"Shape of train_X is {self.train_X.shape}", flush=True)
 
             try:
                 # self.model = keras.Sequential()
@@ -714,7 +835,7 @@ class KerasClf:
                     ],
                 )
 
-                print(self.model.summary())
+                print(self.model.summary(), flush=True)
 
             except Exception:
                 logging.exception("Exception occurred while initializing Keras model.")
@@ -729,7 +850,8 @@ class KerasClf:
                 dummy_clf_metric = metric_fn(self.train_y, dummy_clf_y_pred,)
                 print(
                     f"{name} for dummy classifier always predicting the "
-                    f"minority class is {dummy_clf_metric}."
+                    f"minority class is {dummy_clf_metric}.",
+                    flush=True,
                 )
             del dummy_clf_y_pred
 
@@ -742,8 +864,8 @@ class KerasClf:
 
                 class_weight = {0: weight_for_0, 1: weight_for_1}
 
-                print(f"Weight for class 0: {weight_for_0:.2f}")
-                print(f"Weight for class 1: {weight_for_1:.2f}")
+                print(f"Weight for class 0: {weight_for_0:.2f}", flush=True)
+                print(f"Weight for class 1: {weight_for_1:.2f}", flush=True)
 
             if not params_comb_dict["sample_weight"]:
                 sample_weight = None
@@ -764,7 +886,8 @@ class KerasClf:
 
             params_to_log = {
                 k: self.value_map_for_logging[k][v]
-                if k in self.value_map_for_logging and v in self.value_map_for_logging[k]
+                if k in self.value_map_for_logging
+                and v in self.value_map_for_logging[k]
                 else v
                 for k, v in params_to_log.items()
             }
@@ -779,10 +902,11 @@ class KerasClf:
                 shuffle=True,
                 callbacks=[
                     AddParamsToLogs(params_to_log, combined_counter_num),
+                    ReduceLROnPlateauByBACC(),
                     EarlyStoppingAtMaxBACC(
                         params_comb_dict["epochs"],
                         params_comb_dict["threshold"],
-                        patience=10,
+                        patience=15,
                     ),
                     csv_logger,
                 ],
@@ -830,21 +954,45 @@ class KerasClf:
                         train_vls_to_plot = history.history[m]
                         test_vls_to_plot = history.history[f"val_{m}"]
 
-                    plt.plot(train_vls_to_plot)
-                    plt.plot(test_vls_to_plot)
-                    plt.title(f"Model {m.replace('_',' ').title()} Metric")
-                    plt.ylabel(f"{m.replace('_',' ').title()}")
-                    plt.xlabel("Epoch")
+                    fig, ax = plt.subplots(figsize=(11,7))
+                    ax.plot(train_vls_to_plot)
+                    ax.plot(test_vls_to_plot)
+                    ax.set_title(f"Model {m.replace('_',' ').title()} Metric")
+                    ax.set_ylabel(f"{m.replace('_',' ').title()}")
+                    ax.set_xlabel("Epoch")
                     n_epochs = len(history.history[m])
-                    plt.xticks(
+                    ax.set_xticks(
+                        np.arange(0, n_epochs, step=1),
+                        # np.arange(1, n_epochs + 1, step=1),
+                        minor=True,
+                    )
+                    ax.set_xticks(
                         np.arange(0, n_epochs, step=1),
                         np.arange(1, n_epochs + 1, step=1),
                     )
-                    plt.legend(["Train", "Test"], loc="upper right")
+                    # https://matplotlib.org/3.1.1/gallery/ticks_and_spines/tick-locators.html
+                    ax.xaxis.set_major_locator(plt.IndexLocator(5, 4))
+                    ax.legend(["Train", "Test"], loc="lower right")
 
                     png_fname = combined_counter + f"_{m}.png"
-                    plt.savefig(png_fname)
-                    plt.clf()  # clear current figure
+                    fig.savefig(png_fname)
+                    fig.clf()  # clear current figure
+
+                    # plt.plot(train_vls_to_plot)
+                    # plt.plot(test_vls_to_plot)
+                    # plt.title(f"Model {m.replace('_',' ').title()} Metric")
+                    # plt.ylabel(f"{m.replace('_',' ').title()}")
+                    # plt.xlabel("Epoch")
+                    # n_epochs = len(history.history[m])
+                    # plt.xticks(
+                    #     np.arange(0, n_epochs, step=1),
+                    #     np.arange(1, n_epochs + 1, step=1),
+                    # )
+                    # plt.legend(["Train", "Test"], loc="upper right")
+
+                    # png_fname = combined_counter + f"_{m}.png"
+                    # plt.savefig(png_fname)
+                    # plt.clf()  # clear current figure
 
                     try:
                         key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
@@ -882,7 +1030,7 @@ class KerasClf:
                         for result in (
                             "precision_list_",
                             "precision_thresh_list_",
-                            "recall_list",
+                            "recall_list_",
                             "recall_thresh_list_",
                             "F1_score_list_",
                             "F1_score_thresh_list_",
