@@ -15,6 +15,7 @@ calculated with the predict() function
 TO DO:
 - Update stop_instance function to allow for it to be run in the background
 with threading (https://stackoverflow.com/questions/7168508/background-function-in-python)
+- Convert s3 upload sections into a decorator
 
 DECIDED TO SKIP FOR NOW:
 - Update validation data specification in the model fit() method to accept
@@ -26,10 +27,12 @@ multiple validation sets
 from collections import defaultdict
 from datetime import datetime
 from itertools import product
+import json
 import logging
 import os
 from pathlib import Path
 import platform
+from shutil import make_archive
 import sys
 import time
 
@@ -102,13 +105,14 @@ class ReduceLROnPlateauByBACC(callbacks.Callback):
     def __init__(
         self,
         monitor="val_balanced_acc",
-        factor=0.1,
+        factor=0.5,
         patience=7,
         verbose=1,
         mode="max",
         min_delta=0.0,
         cooldown=0,
         min_lr=0,
+        combined_counter="",
         **kwargs,
     ):
         super(ReduceLROnPlateauByBACC, self).__init__()
@@ -116,13 +120,13 @@ class ReduceLROnPlateauByBACC(callbacks.Callback):
         self.monitor = monitor
         if factor >= 1.0:
             raise ValueError(
-                f'ReduceLROnPlateau does not support a factor >= 1.0. Got {factor}'
+                f"ReduceLROnPlateau does not support a factor >= 1.0. Got {factor}"
             )
-        if 'epsilon' in kwargs:
-            min_delta = kwargs.pop('epsilon')
+        if "epsilon" in kwargs:
+            min_delta = kwargs.pop("epsilon")
             logging.warning(
-                '`epsilon` argument is deprecated and '
-                'will be removed, use `min_delta` instead.'
+                "`epsilon` argument is deprecated and "
+                "will be removed, use `min_delta` instead."
             )
         self.factor = factor
         self.min_lr = min_lr
@@ -137,16 +141,20 @@ class ReduceLROnPlateauByBACC(callbacks.Callback):
         self.monitor_op = None
         self._reset()
 
+        # per https://tensorflow.org/api_docs/python/tf/keras/callbacks/LambdaCallback
+        self.json_log = open("lr_change_log.json", mode="at", buffering=1)
+        self.combined_counter = combined_counter
+
     def _reset(self):
         """Resets wait counter and cooldown counter.
         """
-        if self.mode not in ['auto', 'min', 'max']:
+        if self.mode not in ["auto", "min", "max"]:
             logging.warning(
-                'Learning rate reduction mode %s is unknown, '
-                'fallback to auto mode.', self.mode
+                "Learning rate reduction mode %s is unknown, " "fallback to auto mode.",
+                self.mode,
             )
-            self.mode = 'auto'
-        if (self.mode == 'min' or (self.mode == 'auto' and 'acc' not in self.monitor)):
+            self.mode = "auto"
+        if self.mode == "min" or (self.mode == "auto" and "acc" not in self.monitor):
             self.monitor_op = lambda a, b: np.less(a, b - self.min_delta)
             self.best = np.Inf
         else:
@@ -186,14 +194,32 @@ class ReduceLROnPlateauByBACC(callbacks.Callback):
                         new_lr = old_lr * self.factor
                         new_lr = max(new_lr, self.min_lr)
                         backend.set_value(self.model.optimizer.lr, new_lr)
+
+                        # write the new learning rate and the first epoch for that rate
+                        # (which will be current epoch number plus 1) to json
+                        # combined_counter identifies the combination of hyperparameters
+                        # and validation set
+                        self.json_log.write(
+                            json.dumps(
+                                {
+                                    "combined_counter": self.combined_counter,
+                                    "epoch": epoch + 1,
+                                    "lr": new_lr,
+                                }
+                            ) + "\n"
+                        )
+
                         if self.verbose > 0:
                             print(
-                                f"Learning rate will be reduced after epoch "
-                                f"{epoch+1} to {new_lr}.",
+                                f"Learning rate will be reduced after "
+                                f"epoch {epoch+1} to {new_lr}.",
                                 flush=True,
                             )
                         self.cooldown_counter = self.cooldown
                         self.wait = 0
+
+    def on_train_end(self, logs=None):
+        self.json_log.close()
 
     def in_cooldown(self):
         return self.cooldown_counter > 0
@@ -213,13 +239,16 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
         number of no improvement, training stops.
   """
 
-    def __init__(self, total_epochs, thresh_list, patience=0):
+    def __init__(self, total_epochs, thresh_list, patience=0, combined_counter=""):
         super(EarlyStoppingAtMaxBACC, self).__init__()
         self.total_epochs = total_epochs
         self.thresh_list = thresh_list
         self.patience = patience
         # best_weights to store the weights at which the maximum BACC occurs.
         self.best_weights = None
+
+        self.best_epoch_log = open("best_epoch_log.json", mode="at", buffering=1)
+        self.combined_counter = combined_counter
 
     def on_train_begin(self, logs=None):
         # The number of epoch it has waited when metric is no longer maximum.
@@ -249,12 +278,18 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
             if self.wait >= self.patience:
                 self.stopped_epoch = epoch
                 self.model.stop_training = True
-                print("Restoring model weights from the end of the best epoch.", flush=True)
+                print(
+                    "Restoring model weights from the end of the best epoch.",
+                    flush=True,
+                )
                 self.model.set_weights(self.best_weights)
             # if stopping training because of the total epochs limit
             elif (epoch + 1) == self.total_epochs:
                 self.stopped_epoch = 0
-                print("Restoring model weights from the end of the best epoch.", flush=True)
+                print(
+                    "Restoring model weights from the end of the best epoch.",
+                    flush=True,
+                )
                 self.model.set_weights(self.best_weights)
 
     def on_train_end(self, logs=None):
@@ -276,6 +311,16 @@ class EarlyStoppingAtMaxBACC(callbacks.Callback):
                 f"best validation BACC: {self.best_metric}.",
                 flush=True,
             )
+        # write the best epoch number for the current combined_counter value to the json log
+        self.best_epoch_log.write(
+            json.dumps(
+                {
+                    "combined_counter": self.combined_counter,
+                    "best_epoch": self.best_epoch - 1,
+                }
+            ) + "\n"
+        )
+        self.best_epoch_log.close()
 
 
 class AddParamsToLogs(callbacks.Callback):
@@ -293,6 +338,32 @@ class AddParamsToLogs(callbacks.Callback):
         logs["train_params_counter"] = self.counter
         for k in self.hyperparams.keys():
             logs[k] = self.hyperparams[k]
+
+
+class CustomLearningRateScheduler(callbacks.Callback):
+    """Learning rate schedule which sets the learning rate according to schedule.
+    Per https://tensorflow.org/guide/keras/custom_callback#learning_rate_scheduling
+
+    Parameters:
+    -----------
+        schedule: a function that takes an epoch index
+            (integer, indexed from 0) and current learning rate
+            as inputs and returns a new learning rate as output (float).
+    """
+
+    def __init__(self, schedule):
+        super(CustomLearningRateScheduler, self).__init__()
+        self.schedule = schedule
+
+    def on_epoch_begin(self, epoch, logs=None):
+        if not hasattr(self.model.optimizer, "lr"):
+            raise ValueError('Optimizer must have a "lr" attribute.')
+        # Get the current learning rate from model's optimizer.
+        lr = float(backend.get_value(self.model.optimizer.lr))
+        # Call schedule function to get the scheduled learning rate.
+        scheduled_lr = self.schedule(epoch, lr)
+        # Set the value back to the optimizer before this epoch starts
+        backend.set_value(self.model.optimizer.lr, scheduled_lr)
 
 
 class KerasClf:
@@ -347,16 +418,20 @@ class KerasClf:
         self.params = {
             "gamma": [
                 # 0.0,
-                2.0,
+                # 2.0,
+                # 3.0,
+                4.0,
+                # 5.0,
             ],  # When gamma=0, binary focal crossentropy is equivalent to the binary crossentropy loss.
             "label_smoothing": [0.0],
-            "learning_rate": [0.003],
+            "learning_rate": [0.003, 0.0003],
             "batch_size": [2048],
             "epochs": [120],
             "threshold": [list(np.linspace(0, 1, num=200, endpoint=False))],
             "bias_initializer": ["compute"],
             "class_weight": ["compute"],
-            "sample_weight": [14],
+            "sample_weight": [7, 14],
+            "batch_norm": [None, "all", "skip_last"],
         }
         assert all(
             [isinstance(v, list) for v in self.params.values()]
@@ -370,6 +445,9 @@ class KerasClf:
         assert all(
             [v is None or isinstance(v, int) for v in self.params["sample_weight"]]
         ), "Allowed sample_weight values are None and integers."
+        assert all(
+            [v in (None, "all", "skip_last",) for v in self.params["batch_norm"]]
+        ), "Allowed batch_norm values are None, 'all' and 'skip_last'."
         logging.info(
             "Model parameters used: "
             + ", ".join([f"{k}: {v}" for k, v in self.params.items()])
@@ -379,6 +457,7 @@ class KerasClf:
             "bias_initializer": {"default": 0, "compute": 1},
             "class_weight": {None: 0, "compute": 1},
             "sample_weight": {None: 0},
+            "batch_norm": {None: 0, "all": 1, "skip_last": 2},
         }
 
         # determine if there is more than one combination of hyperparameters
@@ -413,7 +492,7 @@ class KerasClf:
 
         return get_stats
 
-    def gridsearch_wfv(self):
+    def gridsearch_wfv(self, refit=False):
 
         self.all_params_combs = list()
 
@@ -428,30 +507,45 @@ class KerasClf:
             chunksize=self.chunksize,
             frac=self.frac,
             add_weather_features=self.add_weather_features,
+            refit=refit,
         ):
 
-            first_val_set_ind = train_counter == 1
+            if test:  # if validation set exists (it's a non-empty list)
 
-            get_stats = self.which_stats_to_get(first_val_set_ind, last_val_set_ind)
+                first_val_set_ind = train_counter == 1
 
-            self.train_counter = train_counter
+                get_stats = self.which_stats_to_get(first_val_set_ind, last_val_set_ind)
 
-            # the statement below points the test variable to the first dataframe
-            # in the test list, so multiple validation sets are not currently
-            # supported
-            test = test[0]
-            # self.cat_col_cats = [
-            #     np.sort(train[col].unique()) for col in train if col.startswith("cat")
-            # ]
-            self.cat_col_cats = [
-                np.sort(np.unique(np.hstack((train[col].unique(), test[col].unique()))))
-                for col in train.columns.union(test.columns)
-                if col.startswith("cat")
-            ]
+                self.train_counter = train_counter
 
-            self.train_y = train["sid_shop_item_qty_sold_day"].to_numpy()
-            self.test_y = test["sid_shop_item_qty_sold_day"].to_numpy()
-            self.preprocess_features(train, test).fit_and_eval(get_stats)
+                # the statement below points the test variable to the first dataframe
+                # in the test list, so multiple validation sets are not currently
+                # supported
+                test = test[0]
+                # self.cat_col_cats = [
+                #     np.sort(train[col].unique()) for col in train if col.startswith("cat")
+                # ]
+                self.cat_col_cats = [
+                    np.sort(
+                        np.unique(np.hstack((train[col].unique(), test[col].unique())))
+                    )
+                    for col in train.columns.union(test.columns)
+                    if col.startswith("cat")
+                ]
+
+                self.train_y = train["sid_shop_item_qty_sold_day"].to_numpy()
+                self.test_y = test["sid_shop_item_qty_sold_day"].to_numpy()
+                self.preprocess_features(train, test).fit_and_eval(get_stats)
+
+            else:  # empty validation set, meaning going to refit on all data
+                # pass  # don't actually need to do anything here, as the following
+                # statements can be executed after the loop on the train variable
+                self.cat_col_cats = [
+                    np.sort(train[col].unique())
+                    for col in train.columns
+                    if col.startswith("cat")
+                ]
+                self.train_y = train["sid_shop_item_qty_sold_day"].to_numpy()
 
         # calculate average metric values across all folds
         for params_comb_dict in self.all_params_combs:
@@ -464,11 +558,6 @@ class KerasClf:
                     params_comb_dict[f"{metric}_thresh_list_"]
                 )
 
-        best_params = min(self.all_params_combs, key=lambda x: x["avg_F1_score_"])
-        self.best_score_ = best_params["avg_F1_score_"]
-        # remove non-parameter key-values from self.best_params (i.e., rmse_list_ and avg_rmse_, etc.)
-        self.best_params_ = {k: v for k, v in best_params.items() if k in self.params}
-
         # save list of parameter-result dictionaries to dataframe and then to CSV
         if self.all_params_combs:
             all_params_combs_df = pd.DataFrame(self.all_params_combs)
@@ -479,7 +568,7 @@ class KerasClf:
                 key = f"keras_all_params_combs_{self.curr_dt_time}.csv"
                 # global s3_client
                 s3_client = boto3.client("s3")
-                _ = s3_client.upload_file(output_csv, "clf-model-0218", key)
+                _ = s3_client.upload_file(output_csv, "clf-model-0422", key)
                 logging.info(
                     "Name of CSV uploaded to S3 and containing all parameter combinations "
                     f"and results is: {key}"
@@ -494,6 +583,19 @@ class KerasClf:
                 "List of parameter-result dictionaries is empty and was not converted to CSV!"
             )
 
+        if refit:
+            best_params = max(
+                self.all_params_combs, key=lambda x: x["avg_balanced_acc_"]
+            )
+            self.best_score_ = best_params["avg_balanced_acc_"]
+            self.best_comb_counter_ = best_params["counter_"][0]
+            # remove non-parameter key-values from self.best_params
+            self.best_params_ = {
+                k: v for k, v in best_params.items() if k in self.params
+            }
+
+            self.preprocess_features_for_refit(train).refit_and_save()
+
         log_file = Path(self.training_log)
         # if training log file exists (epoch-level parameter-results log file)
         if log_file.is_file():
@@ -501,7 +603,7 @@ class KerasClf:
                 # global s3_client
                 s3_client = boto3.client("s3")
                 _ = s3_client.upload_file(
-                    self.training_log, "clf-model-0218", self.training_log
+                    self.training_log, "clf-model-0422", self.training_log
                 )
                 logging.info(
                     "Name of log file uploaded to S3 and containing all parameter combinations "
@@ -670,6 +772,116 @@ class KerasClf:
 
         return self
 
+    def preprocess_features_for_refit(self, train_X):
+        steps_list = [
+            step for step in self.params["sample_weight"] if isinstance(step, int)
+        ]
+        if steps_list:
+            days_before_last_day = (
+                train_X["sale_date"].max() - train_X["sale_date"]
+            ).dt.days
+            self.sample_weights_dict = dict()
+            for step in steps_list:
+                weights = np.exp((-days_before_last_day // step) / 75).to_numpy()
+                self.sample_weights_dict[step] = weights
+            del days_before_last_day
+
+        train_X = train_X.copy()
+        train_X.drop(self.non_x_cols, axis=1, inplace=True)
+        train_X.reset_index(drop=True, inplace=True)
+
+        train_pcs_df = None
+        if self.add_princomps > 0:  # create additional principal component columns
+            train_pcs_df = self.get_pc_cols_for_refit(
+                train_X[[col for col in train_X if not col.startswith("cat")]],
+                self.add_princomps,
+            )
+
+        train_interaction_df_list = list()
+        if self.add_interactions:
+            for col in [
+                "d_days_after_holiday",
+                "d_days_to_holiday",
+                "d_eurrub",
+                "d_usdrub",
+            ]:
+                train_interaction_df_list.append(
+                    train_X[[cl for cl in train_X if "_7d" in cl]]
+                    .multiply(train_X[col], axis=0)
+                    .rename(
+                        columns={
+                            k: f"{k}_{col}"
+                            for k in [cl for cl in train_X if "_7d" in cl]
+                        }
+                    )
+                )
+
+        if self.add_princomps > 0 or self.add_interactions:
+            train_X = pd.concat(
+                [
+                    train_X[[col for col in train_X if col.startswith("cat")]],
+                    train_pcs_df,
+                    *train_interaction_df_list,
+                ],
+                axis=1,
+            )
+            del (
+                train_pcs_df,
+                train_interaction_df_list,
+            )
+
+        rng = np.random.RandomState(304)
+        qt = QuantileTransformer(output_distribution="normal", random_state=rng)
+
+        if self.scaler == "s":
+            sc = StandardScaler()
+        elif self.scaler == "m":
+            sc = MinMaxScaler()
+        elif self.scaler == "r":
+            sc = RobustScaler()
+
+        numeric_features = [col for col in train_X if not col.startswith("cat")]
+        categorical_features = [col for col in train_X.columns if col.startswith("cat")]
+
+        if self.pipe_steps == 0:
+            steps = [("qt_normal", qt)]
+        elif self.pipe_steps == 1:
+            steps = [("scaler", sc)]
+        elif self.pipe_steps == 2:
+            steps = [("qt_normal", qt), ("scaler", sc)]
+        numeric_transformer = Pipeline(steps=steps)
+
+        categorical_transformer = OneHotEncoder(
+            categories=self.cat_col_cats, drop="first", dtype="uint8", sparse=False,
+        )
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ("num", numeric_transformer, numeric_features),
+                ("cat", categorical_transformer, categorical_features),
+            ]
+        )
+
+        self.train_X = pd.DataFrame(
+            preprocessor.fit_transform(train_X),
+            columns=numeric_features
+            + preprocessor.named_transformers_["cat"]
+            .get_feature_names(categorical_features)
+            .tolist(),
+            dtype="float32",
+        )
+
+        if self.effect_coding:
+            self.train_X[
+                [col for col in self.train_X if col.startswith("cat")]
+            ] = self.train_X[
+                [col for col in self.train_X if col.startswith("cat")]
+            ].replace(
+                0.0, -1.0
+            )
+
+        return self
+
     def get_pc_cols(self, train_X, test_X, n_components):
         scaler = StandardScaler()
         pca = PCA(n_components=n_components)
@@ -692,6 +904,21 @@ class KerasClf:
         )
 
         return pca_transformed_train_X, pca_transformed_test_X
+
+    def get_pc_cols_for_refit(self, train_X, n_components):
+        scaler = StandardScaler()
+        pca = PCA(n_components=n_components)
+
+        scaled_train_X = scaler.fit_transform(train_X)
+        pca_transformed_train_X = pca.fit_transform(scaled_train_X)
+        del scaled_train_X
+        # pca_transformed_train_X = np.log(np.abs(pca_transformed_train_X))
+
+        pca_transformed_train_X = pd.DataFrame(
+            pca_transformed_train_X, columns=[f"pc_{c}" for c in range(n_components)]
+        )
+
+        return pca_transformed_train_X
 
     def fit_and_eval(self, get_stats):
 
@@ -732,7 +959,8 @@ class KerasClf:
                         activation="relu",
                     )
                 )
-                self.model.add(layers.BatchNormalization())
+                if params_comb_dict["batch_norm"] in ("all", "skip_last",):
+                    self.model.add(layers.BatchNormalization())
                 # self.model.add(layers.Dropout(0.2))
                 self.model.add(layers.Dense(layer_size, activation="relu"))
                 # self.model.add(layers.Dropout(0.2))
@@ -750,7 +978,12 @@ class KerasClf:
                 # self.model.add(
                 #     layers.Activation("exponential")
                 # )  # need to specify number of nodes?
-                self.model.add(layers.BatchNormalization())
+                if params_comb_dict["batch_norm"] in ("all", "skip_last",):
+                    self.model.add(layers.BatchNormalization())
+
+                self.model.add(layers.Dense(layer_size, activation="relu"))
+                if params_comb_dict["batch_norm"] in ("all",):
+                    self.model.add(layers.BatchNormalization())
 
                 neg, pos = np.bincount(self.train_y)
                 total = neg + pos
@@ -902,11 +1135,12 @@ class KerasClf:
                 shuffle=True,
                 callbacks=[
                     AddParamsToLogs(params_to_log, combined_counter_num),
-                    ReduceLROnPlateauByBACC(),
+                    ReduceLROnPlateauByBACC(combined_counter=combined_counter),
                     EarlyStoppingAtMaxBACC(
                         params_comb_dict["epochs"],
                         params_comb_dict["threshold"],
-                        patience=15,
+                        patience=17,
+                        combined_counter=combined_counter,
                     ),
                     csv_logger,
                 ],
@@ -935,6 +1169,21 @@ class KerasClf:
 
             if get_stats:
 
+                lr_schedule_list = []
+                with open("lr_change_log.json", "r") as f:
+                    for line in f:
+                        lr_schedule_list.append(json.loads(line))
+
+                # filter the list to only include the schedule for the current combined_counter value
+                lr_schedule_list = [
+                    d
+                    for d in lr_schedule_list
+                    if d["combined_counter"] == combined_counter
+                ]
+
+                # retrieve epoch numbers of when updated learning rates were first used
+                epochs_of_first_lr_use = [int(d["epoch"]) for d in lr_schedule_list]
+
                 s3_client = boto3.client("s3")
                 for m in (
                     "recall_score",
@@ -954,7 +1203,7 @@ class KerasClf:
                         train_vls_to_plot = history.history[m]
                         test_vls_to_plot = history.history[f"val_{m}"]
 
-                    fig, ax = plt.subplots(figsize=(11,7))
+                    fig, ax = plt.subplots(figsize=(11, 7))
                     ax.plot(train_vls_to_plot)
                     ax.plot(test_vls_to_plot)
                     ax.set_title(f"Model {m.replace('_',' ').title()} Metric")
@@ -973,6 +1222,11 @@ class KerasClf:
                     # https://matplotlib.org/3.1.1/gallery/ticks_and_spines/tick-locators.html
                     ax.xaxis.set_major_locator(plt.IndexLocator(5, 4))
                     ax.legend(["Train", "Test"], loc="lower right")
+
+                    # add black dashed vertical lines for epochs when updated learning rates
+                    # were first used
+                    for epoch_num in epochs_of_first_lr_use:
+                        ax.axvline(x=epoch_num, color="k", linestyle="--")
 
                     png_fname = combined_counter + f"_{m}.png"
                     fig.savefig(png_fname)
@@ -996,7 +1250,7 @@ class KerasClf:
 
                     try:
                         key = f"{combined_counter}_{self.curr_dt_time}_{m}.png"
-                        _ = s3_client.upload_file(png_fname, "clf-model-0218", key)
+                        _ = s3_client.upload_file(png_fname, "clf-model-0422", key)
 
                     except ClientError:
                         logging.exception(
@@ -1089,6 +1343,288 @@ class KerasClf:
         # )
 
         return clf_metric, best_threshold
+
+    def lr_schedule(self, epoch, lr):
+        """Helper function to retrieve the scheduled learning rate based on epoch."""
+        lr_schedule_list = []
+        with open("lr_change_log.json", "r") as f:
+            for line in f:
+                lr_schedule_list.append(json.loads(line))
+
+        # filter the list to only include the schedule for the best combined_counter value
+        lr_schedule_list = [
+            d
+            for d in lr_schedule_list
+            if d["combined_counter"] == self.best_comb_counter_
+        ]
+
+        if (
+            epoch < lr_schedule_list[0]["epoch"]
+            or epoch > lr_schedule_list[-1]["epoch"]
+        ):
+            return lr
+        for i in range(len(lr_schedule_list)):
+            if epoch == lr_schedule_list[i]["epoch"]:
+                return lr_schedule_list[i]["lr"]
+        return lr
+
+    def refit_and_save(self):
+
+        print(f"Shape of train_X is {self.train_X.shape}", flush=True)
+
+        try:
+            self.model = Sequential()
+
+            layer_size = 2 ** (round(np.log(self.train_X.shape[1]) / np.log(2))) // 2
+
+            ki = initializers.RandomNormal(mean=0.0, stddev=0.05, seed=123)
+            self.model.add(
+                layers.Dense(
+                    layer_size,
+                    kernel_initializer=ki,
+                    bias_initializer="zeros",
+                    input_shape=(self.train_X.shape[1],),
+                    activation="relu",
+                )
+            )
+            if self.best_params_["batch_norm"] in ("all", "skip_last",):
+                self.model.add(layers.BatchNormalization())
+            # self.model.add(layers.Dropout(0.2))
+            self.model.add(layers.Dense(layer_size, activation="relu"))
+            # self.model.add(layers.Dropout(0.2))
+            # self.model.add(layers.Dense(64, activation="relu"))
+            # self.model.add(
+            #     layers.Dense(
+            #         layer_size,
+            #         kernel_initializer=ki,
+            #         bias_initializer="zeros",
+            #         input_shape=(self.train_X.shape[1],),
+            #         activation="relu",
+            #     )
+            # )
+            # self.model.add(layers.Dense(layer_size // 2, activation="relu"))
+            # self.model.add(
+            #     layers.Activation("exponential")
+            # )  # need to specify number of nodes?
+            if self.best_params_["batch_norm"] in ("all", "skip_last",):
+                self.model.add(layers.BatchNormalization())
+
+            self.model.add(layers.Dense(layer_size, activation="relu"))
+            if self.best_params_["batch_norm"] in ("all",):
+                self.model.add(layers.BatchNormalization())
+
+            neg, pos = np.bincount(self.train_y)
+            total = neg + pos
+            if self.best_params_["bias_initializer"] == "default":
+                bias_initializer = "zeros"
+            elif self.best_params_["bias_initializer"] == "compute":
+                output_bias = np.log([pos / neg])
+                bias_initializer = initializers.Constant(output_bias)
+            self.model.add(
+                layers.Dense(1, activation="sigmoid", bias_initializer=bias_initializer)
+            )
+            # self.model.add(layers.Dense(1))
+
+            # opt = optimizers.Adam(learning_rate=params_comb_dict["learning_rate"])
+            opt = optimizers.adam_v2.Adam(
+                learning_rate=self.best_params_["learning_rate"]
+            )
+            # initial_learning_rate = 0.1
+            # lr_schedule = optimizers.schedules.ExponentialDecay(
+            #     initial_learning_rate,
+            #     decay_steps=100_000,
+            #     decay_rate=0.96,
+            #     staircase=True
+            # )
+            # opt = optimizers.SGD(learning_rate=lr_schedule, momentum=0.9)
+            # opt = optimizers.SGD(learning_rate=0.001, momentum=0.9)
+            # callback = callbacks.EarlyStopping(
+            #     monitor="val_f1_score",
+            #     patience=10,
+            #     mode="max",
+            #     restore_best_weights=True,
+            # )
+            if self.best_params_["gamma"] == 0.0:
+                loss = losses.BinaryCrossentropy(
+                    label_smoothing=self.best_params_["label_smoothing"]
+                )
+            else:
+                loss = losses.BinaryFocalCrossentropy(
+                    gamma=self.best_params_["gamma"],
+                    label_smoothing=self.best_params_["label_smoothing"],
+                )
+
+            self.model.compile(
+                loss=loss,
+                # loss=losses.BinaryFocalCrossentropy(
+                #     gamma=params_comb_dict["gamma"],
+                #     label_smoothing=params_comb_dict["label_smoothing"],
+                # ),
+                optimizer=opt,
+                metrics=[
+                    metrics.TruePositives(
+                        thresholds=self.best_params_["threshold"], name="tp",
+                    ),
+                    metrics.FalsePositives(
+                        thresholds=self.best_params_["threshold"], name="fp",
+                    ),
+                    metrics.TrueNegatives(
+                        thresholds=self.best_params_["threshold"], name="tn",
+                    ),
+                    metrics.FalseNegatives(
+                        thresholds=self.best_params_["threshold"], name="fn",
+                    ),
+                    metrics.Recall(
+                        thresholds=self.best_params_["threshold"], name="recall_score",
+                    ),
+                    metrics.Precision(
+                        thresholds=self.best_params_["threshold"],
+                        name="precision_score",
+                    ),
+                    tfa.metrics.F1Score(num_classes=1, threshold=0.5, name="f1_score",),
+                    BACC(
+                        thresholds=self.best_params_["threshold"], name="balanced_acc",
+                    ),
+                    metrics.AUC(name="auc"),
+                    metrics.AUC(name="prc", curve="PR"),  # precision-recall curve
+                ],
+            )
+
+            print(self.model.summary(), flush=True)
+
+        except Exception:
+            logging.exception("Exception occurred while initializing Keras model.")
+            sys.exit(1)
+
+        # estimate baseline model
+        dummy_clf = DummyClassifier(strategy="constant", constant=1)
+        dummy_clf.fit(self.train_X, self.train_y)
+        dummy_clf_y_pred = dummy_clf.predict(self.train_X)
+
+        for name, metric_fn in self.clf_metrics.items():
+            dummy_clf_metric = metric_fn(self.train_y, dummy_clf_y_pred,)
+            print(
+                f"{name} for dummy classifier always predicting the "
+                f"minority class is {dummy_clf_metric}.",
+                flush=True,
+            )
+        del dummy_clf_y_pred
+
+        class_weight = None
+        if self.best_params_["class_weight"] == "compute":
+            # Scaling by total/2 helps keep the loss to a similar magnitude.
+            # The sum of the weights of all examples stays the same.
+            weight_for_0 = (1 / neg) * (total / 2.0)
+            weight_for_1 = (1 / pos) * (total / 2.0)
+
+            class_weight = {0: weight_for_0, 1: weight_for_1}
+
+            print(f"Weight for class 0: {weight_for_0:.2f}", flush=True)
+            print(f"Weight for class 1: {weight_for_1:.2f}", flush=True)
+
+        if not self.best_params_["sample_weight"]:
+            sample_weight = None
+        else:
+            sample_weight = self.sample_weights_dict[self.best_params_["sample_weight"]]
+
+        csv_logger = callbacks.CSVLogger(self.training_log, append=True)
+
+        params_to_log = self.best_params_.copy()
+        params_to_log["threshold_min"] = round(min(params_to_log["threshold"]), 2)
+        params_to_log["threshold_max"] = round(max(params_to_log["threshold"]), 2)
+        params_to_log["threshold_step"] = round(
+            params_to_log["threshold"][1] - params_to_log["threshold"][0], 3
+        )
+        del params_to_log["threshold"]
+
+        params_to_log = {
+            k: self.value_map_for_logging[k][v]
+            if k in self.value_map_for_logging and v in self.value_map_for_logging[k]
+            else v
+            for k, v in params_to_log.items()
+        }
+        combined_counter_num = (
+            999.99  # generic number to identify model trained on full data
+        )
+
+        best_epoch_list = []
+        with open("best_epoch_log.json", "r") as f:
+            for line in f:
+                best_epoch_list.append(json.loads(line))
+        # filter the list to only include the best epoch for the best combined_counter value
+        best_epoch_list = [
+            d
+            for d in best_epoch_list
+            if d["combined_counter"] == self.best_comb_counter_
+        ]
+        # get the best epoch from that one dictionary
+        best_epoch = int(best_epoch_list[0]["best_epoch"])
+
+        _ = self.model.fit(
+            x=self.train_X,  # A Numpy array (or array-like), or a list of arrays (in case the model has multiple inputs)
+            y=self.train_y,
+            epochs=best_epoch,
+            batch_size=self.best_params_["batch_size"],
+            shuffle=True,
+            callbacks=[
+                AddParamsToLogs(params_to_log, combined_counter_num),
+                CustomLearningRateScheduler(self.lr_schedule),
+                csv_logger,
+            ],
+            class_weight=class_weight,
+            sample_weight=sample_weight,
+            verbose=2,
+        )
+
+        # save the trained model
+        model_dir = "best_cls_model"
+        self.model.save(model_dir)
+
+        # create zip archive of saved model
+        archive_name = ""
+        try:
+            # where to create the archive, including the directory path and the name
+            # of the archive, without the file extension
+            model_zip = os.path.join(os.getcwd(), model_dir)
+            # directory that will be the root directory of the archive, all paths in
+            # the archive will be relative to it
+            root_dir = os.getcwd()
+            # the directory where we start archiving from; i.e. base_dir will be the
+            # common prefix of all files and directories in the archive. base_dir
+            # must be given relative to root_dir.
+            # model_dir will be used as base_dir here (see last argument in
+            # make_archive() below)
+            archive_name = make_archive(model_zip, "zip", root_dir, model_dir)
+            logging.debug(
+                f"Name and path of ZIP archive containing saved Keras model is "
+                f"{archive_name}."
+            )
+        except Exception:
+            logging.exception(
+                "Exception occurred while creating zip archive of saved Keras model."
+            )
+
+        model_zip = Path(archive_name)
+        # if saved model archive zip file exists
+        if model_zip.is_file():
+            try:
+                key = f"{model_dir}_{self.curr_dt_time}.zip"
+                # global s3_client
+                s3_client = boto3.client("s3")
+                _ = s3_client.upload_file(f"{model_dir}.zip", "clf-model-0422", key)
+                logging.info(
+                    "Name of ZIP uploaded to S3 and containing saved best Keras classification "
+                    f"model is: {key}"
+                )
+            except ClientError:
+                logging.exception(
+                    "ZIP file with saved best Keras classification model was not copied to S3."
+                )
+        else:
+            logging.debug(
+                "ZIP file with saved best Keras classification model was "
+                "not found and not copied to S3."
+            )
 
 
 def main():
@@ -1220,6 +1756,17 @@ def main():
         choices=["all", "first", "last"],
     )
 
+    parser.add_argument(
+        "--refit",
+        "-r",
+        help=(
+            "retrain the model on all available data using the best hyperparameters "
+            "(if included) or not (if not included)"
+        ),
+        default=False,
+        action="store_true",
+    )
+
     args = parser.parse_args()
 
     if month_counter(args.startmonth) - args.n_months_in_first_train_set + 1 <= 0:
@@ -1303,7 +1850,7 @@ def main():
         f"pipe_steps: {args.pipe_steps}, scaler: {args.scaler}, effect_coding: {args.effect_coding}, "
         f"add_princomps: {args.add_princomps}, and add_interactions: {args.add_interactions}, "
         f"stats_only_for_one_param_comb: {args.stats_only_for_one_param_comb}, "
-        f"val_set_needing_stats: {args.val_set_needing_stats}...",
+        f"val_set_needing_stats: {args.val_set_needing_stats}, refit: {args.refit}...",
     )
 
     model = KerasClf(
@@ -1324,7 +1871,7 @@ def main():
         stats_only_for_one_param_comb=args.stats_only_for_one_param_comb,
         val_set_needing_stats=args.val_set_needing_stats,
     )
-    model.gridsearch_wfv()
+    model.gridsearch_wfv(refit=args.refit)
 
     # copy log file to S3 bucket
     s3_client = boto3.client("s3")
